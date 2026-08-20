@@ -172,6 +172,13 @@ pub fn check(ctx: &mut Ctx, args: &CheckArgs) -> Result<()> {
                     let st = if repairable { State::Corrupt } else { State::Unrecoverable };
                     let what = if bc.extra_bytes > 0 && bc.bad_blocks.len() <= 1 {
                         format!("{} extra bytes appended", bc.extra_bytes)
+                    } else if !bc.unreadable_blocks.is_empty() {
+                        format!(
+                            "{} bad block(s) of {} ({} unreadable: the filesystem returned EIO — on ZFS see `zpool status -v`)",
+                            bc.bad_blocks.len(),
+                            bc.n_blocks,
+                            bc.unreadable_blocks.len()
+                        )
                     } else {
                         format!("{} bad block(s) of {}", bc.bad_blocks.len(), bc.n_blocks)
                     };

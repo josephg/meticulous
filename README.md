@@ -112,6 +112,15 @@ running `zpool status -v` (and optionally a `zpool scrub`). Note ZFS can only
 vouch for data since it was written to ZFS — damage that happened on older
 disks is invisible to it; use `import` with your old md5/sha1 lists for that.
 
+**When ZFS itself reports a corrupt file** (`EIO` on read, listed in
+`zpool status -v`): ZFS refuses to return the bad record but happily returns
+the rest. `checksummer check` reads around the bad records, counts them as
+*unreadable* blocks, and if the file has parity `repair` (or `check --repair`)
+rebuilds them from the good blocks + parity, writing a fresh copy and renaming
+it over the damaged one. Afterwards run `zpool clear <pool>` (or a scrub) so
+the stale error entry disappears. Files without parity are `unrecoverable`
+and must come from a backup/snapshot.
+
 ZFS's own checksums are per record, computed over the *compressed* on-disk
 bytes, `fletcher4` by default, and its blake3/skein/edonr are salted per pool.
 checksummer can hash with `--algo fletcher4|sha256|sha512-256` (ZFS's

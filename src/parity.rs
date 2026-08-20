@@ -6,7 +6,7 @@ use crate::hash::Algo;
 use anyhow::{Context, Result, bail, ensure};
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::fs::File;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const READ_CHUNK: usize = 1 << 20;
@@ -117,6 +117,72 @@ fn encode_inner(f: &mut File, algo: Algo, layout: Layout, w: &mut Writer) -> Res
     Ok(Encoded { file_hash: file_hasher.finish(), bytes_read: total })
 }
 
+/// Random-access byte source. Abstracted so tests can inject EIO on chosen
+/// blocks; `File` is the real one.
+pub trait BlockSource {
+    /// Read up to `buf.len()` bytes at `off`; short reads only at EOF.
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> std::io::Result<usize>;
+}
+
+impl BlockSource for File {
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::unix::fs::FileExt;
+        let mut n = 0;
+        while n < buf.len() {
+            match FileExt::read_at(self, &mut buf[n..], off + n as u64) {
+                Ok(0) => break,
+                Ok(r) => n += r,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(n)
+    }
+}
+
+fn is_io_data_error(e: &std::io::Error) -> bool {
+    // EIO: the filesystem (e.g. ZFS) refused to return a block whose checksum failed.
+    e.raw_os_error() == Some(5) || e.kind() == std::io::ErrorKind::InvalidData
+}
+
+/// Read `[off, off+len)` in block-sized pieces, tolerating EIO per block.
+/// Returns bytes read (contiguous-valid length up to EOF) and the indices
+/// (relative to `off / bs`) of blocks that could not be read; those bytes are
+/// left zeroed. Non-EIO errors propagate.
+fn read_region_tolerant(src: &mut dyn BlockSource, off: u64, buf: &mut [u8], bs: usize) -> std::io::Result<(usize, Vec<usize>)> {
+    match src.read_at(off, buf) {
+        Ok(n) => Ok((n, vec![])),
+        Err(e) if is_io_data_error(&e) => {
+            // Retry block by block so one bad record only loses its own blocks.
+            let mut unreadable = Vec::new();
+            let mut total = 0usize;
+            let mut eof = false;
+            let mut i = 0usize;
+            while i * bs < buf.len() && !eof {
+                let s = i * bs;
+                let e = (s + bs).min(buf.len());
+                match src.read_at(off + s as u64, &mut buf[s..e]) {
+                    Ok(n) => {
+                        total = s + n;
+                        if n < e - s {
+                            eof = true;
+                        }
+                    }
+                    Err(e2) if is_io_data_error(&e2) => {
+                        buf[s..e].fill(0);
+                        unreadable.push(i);
+                        total = e;
+                    }
+                    Err(e2) => return Err(e2),
+                }
+                i += 1;
+            }
+            Ok((total, unreadable))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Result of verifying a file against its sidecar.
 #[derive(Debug, Default)]
 pub struct BlockCheck {
@@ -126,6 +192,9 @@ pub struct BlockCheck {
     /// Indices of blocks whose content hash does not match (includes blocks
     /// missing because the file is shorter than recorded).
     pub bad_blocks: Vec<u64>,
+    /// Subset of `bad_blocks` the filesystem refused to read at all (EIO —
+    /// on ZFS: a record whose checksum failed and could not be healed).
+    pub unreadable_blocks: Vec<u64>,
     /// Stripes that have more bad blocks than parity blocks.
     pub unrecoverable_stripes: Vec<u64>,
     /// Bytes present on disk beyond the recorded file size.
@@ -143,11 +212,15 @@ impl BlockCheck {
 
 /// Hash every block and the whole file, compare blocks with the sidecar table.
 pub fn check_blocks(path: &Path, sc: &Reader) -> Result<BlockCheck> {
+    let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    check_blocks_from(&mut f, sc)
+}
+
+pub fn check_blocks_from(src: &mut dyn BlockSource, sc: &Reader) -> Result<BlockCheck> {
     ensure!(sc.table_ok(), "sidecar block table is damaged; per-block check impossible");
     let layout = *sc.layout();
     let algo = sc.algo();
     let bs = layout.block_size as usize;
-    let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut buf = vec![0u8; bs.max(READ_CHUNK / bs * bs)];
     let mut file_hasher = algo.hasher();
     let mut block_hasher = algo.hasher();
@@ -155,21 +228,29 @@ pub fn check_blocks(path: &Path, sc: &Reader) -> Result<BlockCheck> {
     let mut block = 0u64;
     let n_blocks = layout.n_blocks();
     let mut bad_per_stripe: std::collections::BTreeMap<u64, u32> = Default::default();
+    let mut pos = 0u64;
 
     loop {
-        let n = read_full(&mut f, &mut buf)?;
+        let (n, unreadable) = read_region_tolerant(src, pos, &mut buf, bs)?;
         if n == 0 {
             break;
         }
+        pos += n as u64;
         out.actual_size += n as u64;
         file_hasher.update(&buf[..n]);
+        let first_block_in_chunk = block;
         let mut off = 0;
         while off < n {
             let end = (off + bs).min(n);
+            let idx_in_chunk = (block - first_block_in_chunk) as usize;
+            let this_unreadable = unreadable.contains(&idx_in_chunk);
             if block < n_blocks {
                 let (bstart, bend) = layout.block_range(block);
                 let expect_len = (bend - bstart) as usize;
-                let ok = if end - off == expect_len {
+                let ok = if this_unreadable {
+                    out.unreadable_blocks.push(block);
+                    false
+                } else if end - off == expect_len {
                     block_hasher.update(&buf[off..end]);
                     if expect_len < bs {
                         let pad = vec![0u8; bs - expect_len];
@@ -197,7 +278,7 @@ pub fn check_blocks(path: &Path, sc: &Reader) -> Result<BlockCheck> {
         *bad_per_stripe.entry(layout.stripe_of_block(block)).or_default() += 1;
         block += 1;
     }
-    out.file_hash = file_hasher.finish();
+    out.file_hash = if out.unreadable_blocks.is_empty() { file_hasher.finish() } else { Vec::new() };
     out.extra_bytes = out.actual_size.saturating_sub(layout.file_size);
     for (stripe, bad) in bad_per_stripe {
         if bad > layout.stripe_parity_blocks(stripe) {
@@ -219,13 +300,17 @@ pub struct RepairOutcome {
 /// `keep_corrupt`: where to move the damaged original (outside the scanned
 /// tree, e.g. `.checksummer/quarantine/...`) instead of deleting it.
 pub fn repair_file(path: &Path, sc: &mut Reader, check: &BlockCheck, keep_corrupt: Option<&Path>, dry_run: bool) -> Result<RepairOutcome> {
+    let mut src_file = File::open(path)?;
+    repair_file_from(&mut src_file, path, sc, check, keep_corrupt, dry_run)
+}
+
+pub fn repair_file_from(src: &mut dyn BlockSource, path: &Path, sc: &mut Reader, check: &BlockCheck, keep_corrupt: Option<&Path>, dry_run: bool) -> Result<RepairOutcome> {
     ensure!(check.repairable(), "stripes {:?} have more damaged blocks than parity blocks", check.unrecoverable_stripes);
     let layout = *sc.layout();
     let algo = sc.algo();
     let bs = layout.block_size as usize;
     let expected_hash = sc.header.file_hash.clone();
 
-    let mut src = File::open(path)?;
     let tmp_path = temp_sibling(path, ".csrepair");
     // In dry-run mode nothing is written to disk: decode into a sink and only hash.
     let mut out: BufWriter<Box<dyn Write>> = if dry_run {
@@ -244,10 +329,9 @@ pub fn repair_file(path: &Path, sc: &mut Reader, check: &BlockCheck, keep_corrup
         let n_par = layout.stripe_parity_blocks(stripe) as usize;
         let first = layout.first_block_of_stripe(stripe);
         let start = first * bs as u64;
-        // Read whatever the file has for this stripe (may be short).
-        src.seek(SeekFrom::Start(start))?;
+        // Read whatever the file has for this stripe (may be short; EIO blocks are zeroed and treated as bad).
         let want = n_data * bs;
-        let got = read_full(&mut src, &mut stripe_buf[..want])?;
+        let (got, unreadable) = read_region_tolerant(src, start, &mut stripe_buf[..want], bs)?;
         stripe_buf[got..want].fill(0);
 
         let mut bad_here = Vec::new();
@@ -259,6 +343,13 @@ pub fn repair_file(path: &Path, sc: &mut Reader, check: &BlockCheck, keep_corrup
                 break;
             }
         }
+        for u in unreadable {
+            if u < n_data && !bad_here.contains(&u) {
+                bad_here.push(u);
+            }
+        }
+        bad_here.sort_unstable();
+        ensure!(bad_here.len() <= n_par, "stripe {stripe}: {} damaged/unreadable blocks exceed {} parity blocks", bad_here.len(), n_par);
         if !bad_here.is_empty() {
             let parity = sc.read_stripe(stripe)?;
             let mut dec = ReedSolomonDecoder::new(n_data, n_par, bs)?;
@@ -344,7 +435,7 @@ pub fn open_sidecar(sidecar: &Path, expected_hash: &[u8]) -> Result<Reader> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
 
     fn mk(dir: &Path, name: &str, data: &[u8]) -> PathBuf {
         let p = dir.join(name);
@@ -442,6 +533,49 @@ mod tests {
     fn truncated_file_is_repairable_within_parity() {
         // last stripe: 313-256=57 blocks, parity 3. Truncate away last 2 blocks.
         assert_eq!(encode_then_damage(20_000, 64, 4096, 50_000, &[], Some(20_000 - 64 - 32)), (true, true));
+    }
+
+    /// A file whose filesystem refuses to read some blocks (EIO), like ZFS
+    /// does for records that fail their checksum.
+    struct EioSource {
+        file: File,
+        bad_blocks: Vec<u64>,
+        bs: u64,
+    }
+    impl BlockSource for EioSource {
+        fn read_at(&mut self, off: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+            let first = off / self.bs;
+            let last = (off + buf.len() as u64).div_ceil(self.bs);
+            if self.bad_blocks.iter().any(|&b| b >= first && b < last) {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            BlockSource::read_at(&mut self.file, off, buf)
+        }
+    }
+
+    #[test]
+    fn eio_blocks_are_erasures_and_repairable() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = pseudo(20_000, 21);
+        let file = mk(dir.path(), "f", &data);
+        let layout = Layout::choose(20_000, 64, 4096, 50_000); // 64 blocks/stripe, 4 parity
+        let sc_path = dir.path().join("f.csp");
+        let enc = encode_file(&file, Algo::Blake3, layout, &sc_path).unwrap();
+        let mut sc = Reader::open(&sc_path).unwrap();
+        // ZFS-style: a 128-byte "record" (2 blocks) unreadable in stripe 0, one block in stripe 3
+        let mut src = EioSource { file: File::open(&file).unwrap(), bad_blocks: vec![10, 11, 200], bs: 64 };
+        let c = check_blocks_from(&mut src, &sc).unwrap();
+        assert_eq!(c.unreadable_blocks, vec![10, 11, 200]);
+        assert_eq!(c.bad_blocks, vec![10, 11, 200]);
+        assert!(c.repairable());
+        assert!(!c.ok(&enc.file_hash));
+        let r = repair_file_from(&mut src, &file, &mut sc, &c, None, false).unwrap();
+        assert_eq!(r.blocks_repaired, 3);
+        assert_eq!(std::fs::read(&file).unwrap(), data);
+        // too many unreadable blocks in one stripe -> unrecoverable
+        let mut src = EioSource { file: File::open(&file).unwrap(), bad_blocks: vec![1, 2, 3, 4, 5], bs: 64 };
+        let c = check_blocks_from(&mut src, &sc).unwrap();
+        assert!(!c.repairable());
     }
 
     #[test]
