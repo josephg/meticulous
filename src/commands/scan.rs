@@ -1,5 +1,5 @@
 use super::Ctx;
-use crate::cli::ScanArgs;
+use crate::cli::{AcceptArgs, ScanArgs};
 use crate::csp;
 use crate::db::{ContentRow, FileRow, State};
 use crate::marks::Resolver;
@@ -83,6 +83,11 @@ pub fn walk(ctx: &Ctx, rels: &[PathBuf], mut f: impl FnMut(Entry) -> Result<()>)
                 }
             };
             if entry.path() == csdir {
+                it.skip_current_dir();
+                continue;
+            }
+            // A visible ZFS snapshot directory at the root would re-index every snapshot.
+            if entry.depth() == 1 && entry.file_type().is_dir() && entry.file_name() == ".zfs" && entry.path().parent() == Some(ctx.archive.root.as_path()) {
                 it.skip_current_dir();
                 continue;
             }
@@ -375,7 +380,7 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
                         Some(&format!("mtime changed but only {} of {} blocks differ (repairable) — treated as suspected corruption, not accepted", bc.bad_blocks.len(), bc.n_blocks)),
                     )?;
                     println!(
-                        "SUSPECTED CORRUPTION: {} — mtime changed but only {} of {} blocks differ; not accepted. `checksummer repair` restores the recorded content; if this really is an edit, `checksummer check` will keep reporting it until you remove and re-add it.",
+                        "SUSPECTED CORRUPTION: {} — mtime changed but only {} of {} blocks differ; not accepted. `checksummer repair` restores the recorded content; if this really is an edit, `checksummer accept <file>` records the new content.",
                         path_display(rel),
                         bc.bad_blocks.len(),
                         bc.n_blocks
@@ -592,6 +597,84 @@ pub fn parity_jobs_for_rows(ctx: &mut Ctx, rows: Vec<FileRow>, resolver: &mut Re
         }
     }
     Ok(ParityPlan { need, uncovered_with_parity, modified })
+}
+
+/// `accept PATHS`: re-hash the named files (or every non-ok file under the
+/// named directories) and record the on-disk content as the truth, with parity
+/// if covered. This is the explicit override for SUSPECTED CORRUPTION /
+/// modified-not-accepted / corrupt states when the user knows the content is right.
+pub fn accept(ctx: &mut Ctx, args: &AcceptArgs) -> Result<()> {
+    if args.paths.is_empty() {
+        anyhow::bail!("give the files or directories to accept");
+    }
+    let rels = ctx.rel_paths_existing(&args.paths)?;
+    let settings = Settings::from_archive(&ctx.archive, args.jobs, ctx.quiet);
+    let mut resolver = Resolver::new(ctx.db.marks()?, ctx.archive.config.parity_default);
+    let explicit: HashSet<PathBuf> = rels.iter().filter(|r| ctx.archive.abs(r).is_file()).cloned().collect();
+    let rows = ctx.db.files_under_any(&rels)?;
+    let mut jobs: Vec<Job<(FileRow, u64, i64)>> = Vec::new();
+    for row in rows {
+        if !(explicit.contains(&row.path) || row.state != State::Ok) {
+            continue;
+        }
+        let abs = ctx.archive.abs(&row.path);
+        let Ok(m) = std::fs::metadata(&abs) else { continue };
+        if !m.is_file() {
+            continue;
+        }
+        let parity = resolver.covers_file(&row.path);
+        jobs.push(Job { rel: row.path.clone(), abs, size: m.len(), work: Work::Hash { parity }, tag: (row, m.len(), mtime_ns(&m)) });
+    }
+    if jobs.is_empty() {
+        println!("nothing to accept");
+        return Ok(());
+    }
+    println!("accepting current content of {} file(s)", jobs.len());
+    let (mut accepted, mut errors) = (0u64, 0u64);
+    let s2 = settings.clone();
+    ctx.db.begin()?;
+    worker::run(jobs, &settings, |job, done| {
+        let (old, seen_size, seen_mtime) = job.tag;
+        match done {
+            Done::Hashed { hash, bytes, layout } => {
+                let Some((size, mtime, inode)) = settled_metadata(&job.abs, seen_size, seen_mtime) else {
+                    println!("changed while hashing (not accepted): {}", path_display(&job.rel));
+                    errors += 1;
+                    return Ok(());
+                };
+                ctx.db.upsert_content(&content_row(&s2, &hash, bytes, layout))?;
+                let t = now();
+                ctx.db.upsert_file(&FileRow {
+                    content_hash: hash.clone(),
+                    size,
+                    mtime_ns: mtime,
+                    inode,
+                    state: State::Ok,
+                    updated_at: t,
+                    last_verified_at: Some(t),
+                    ..old.clone()
+                })?;
+                ctx.db.log_event(&job.rel, "accepted", Some(&format!("{} -> {} (user accepted current content)", hex::encode(&old.content_hash), hex::encode(&hash))))?;
+                println!("accepted: {}", path_display(&job.rel));
+                accepted += 1;
+            }
+            Done::Failed(m) | Done::ReadError(m) => {
+                eprintln!("error: {}: {m}", path_display(&job.rel));
+                errors += 1;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    })?;
+    ctx.db.commit()?;
+    ctx.db.begin()?;
+    ctx.db.prune_orphan_content()?;
+    ctx.db.commit()?;
+    println!("accept complete: {accepted} accepted, {errors} errors");
+    if errors > 0 {
+        ctx.problems = true;
+    }
+    Ok(())
 }
 
 pub fn sidecar_for(ctx: &Ctx, hash: &[u8]) -> PathBuf {

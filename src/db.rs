@@ -154,6 +154,12 @@ pub struct Db {
     backed_up: bool,
     /// Set by `allow_write_despite_hash_mismatch` (fsck / explicit override).
     force: bool,
+    /// A previous session was interrupted (marker file present at open).
+    interrupted: bool,
+}
+
+fn marker_path(db_path: &Path) -> PathBuf {
+    db_path.with_extension("sqlite.inprogress")
 }
 
 const FILE_COLS: &str = "id, path, content_hash, size, mtime_ns, inode, state, added_at, updated_at, last_verified_at";
@@ -220,6 +226,16 @@ impl Db {
         }
         let mut db = Db::open_raw(path)?;
         db.hash_ok = check_db_hash_file(path)?;
+        db.interrupted = marker_path(path).exists();
+        if db.hash_ok == Some(false) && db.interrupted {
+            // The previous checksummer run was interrupted after committing some
+            // work but before it could record the new hash. SQLite transactions are
+            // atomic, so the file is consistent if it passes its own integrity check.
+            if db.integrity_check()?.is_empty() {
+                eprintln!("note: the previous checksummer run was interrupted; the index is intact and will be picked up where it left off");
+                db.hash_ok = None;
+            }
+        }
         let v: Option<String> = db.get_meta("schema_version")?;
         match v.as_deref().map(|s| s.parse::<i64>()) {
             Some(Ok(SCHEMA_VERSION)) => {}
@@ -236,7 +252,7 @@ impl Db {
         conn.execute_batch(
             "PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -65536; PRAGMA busy_timeout = 30000;",
         )?;
-        Ok(Db { conn, path: path.to_path_buf(), dirty: false, hash_ok: None, backed_up: false, force: false })
+        Ok(Db { conn, path: path.to_path_buf(), dirty: false, hash_ok: None, backed_up: false, force: false, interrupted: false })
     }
 
     /// Was the database file unchanged since checksummer last wrote it?
@@ -263,12 +279,16 @@ impl Db {
                 self.path.with_extension("sqlite.bak").display()
             );
         }
-        if self.hash_ok != Some(false) && self.path.exists() && self.conn.is_autocommit() {
+        // Keep the backup from before the interrupted session rather than replacing
+        // it with a half-finished (though consistent) index.
+        if self.hash_ok != Some(false) && !self.interrupted && self.path.exists() && self.conn.is_autocommit() {
             let bak = self.path.with_extension("sqlite.bak");
             let tmp = self.path.with_extension("sqlite.bak.tmp");
             std::fs::copy(&self.path, &tmp).with_context(|| format!("backing up {}", self.path.display()))?;
             std::fs::rename(&tmp, &bak)?;
         }
+        // Marker: "a session is writing"; removed only after the hash file is refreshed.
+        std::fs::write(marker_path(&self.path), std::process::id().to_string())?;
         self.backed_up = true;
         Ok(())
     }
@@ -602,10 +622,11 @@ impl Db {
     /// Close the connection, then (if anything was written) rotate the backup
     /// copy and write the sidecar hash file. Call at the end of every command.
     pub fn finish(self) -> Result<()> {
-        let Db { conn, path, dirty, .. } = self;
+        let Db { conn, path, dirty, backed_up, interrupted, .. } = self;
         conn.close().map_err(|(_, e)| e)?;
-        if dirty {
+        if dirty || backed_up || interrupted {
             write_db_hash_file(&path)?;
+            let _ = std::fs::remove_file(marker_path(&path));
         }
         Ok(())
     }

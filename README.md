@@ -45,6 +45,7 @@ holding `.checksummer/`); you can run commands from any subdirectory.
 | `init [DIR] [--algo] [--block-size] [--parity 5%] [--stripe-size] [--parity-default include\|exclude] [--exclude GLOB]` | create an archive |
 | `scan [PATHS] [--no-accept-changes] [--no-parity] [-j N]` | find added/removed/modified files. New files are hashed (+parity if covered) automatically. Files whose size/mtime changed are re-hashed and accepted as edits. Removed files are listed and you are asked whether to drop them from the index (`-y`/`-n` to answer non-interactively). Renames are detected by content. |
 | `check [PATHS] [--older-than 30d] [--budget 200GiB] [--repair] [-j N]` (alias `verify`) | re-read files and compare to the recorded hashes. Exit code 2 if anything is wrong. `--older-than/--budget` let you scrub incrementally, least-recently-verified first. |
+| `accept PATHS` | record the current on-disk content of the named files (or every flagged file under a directory) as the truth — the override for *SUSPECTED CORRUPTION* / `modified` / `corrupt` when you know the content is right |
 | `repair PATHS [--keep-corrupt] [--dry-run]` | rebuild corrupt files from parity (writes a temp file, verifies the whole-file hash, then atomically replaces the original) |
 | `parity include\|exclude\|unmark DIRS`, `parity list`, `parity sync [--prune]` | choose which subtrees store parity; generate missing parity / delete parity no longer wanted |
 | `status`, `ls [--state S] [--parity] [-l]`, `show PATH`, `history [PATH] [--since 7d]` | inspect |
@@ -54,7 +55,8 @@ holding `.checksummer/`); you can run commands from any subdirectory.
 | `config [KEY [VALUE]]` | show/change settings |
 
 Global flags: `--root DIR`, `-q`, `--json`, `-y`, `-n`. Only one checksummer
-runs per archive at a time (`.checksummer/lock`).
+runs per archive at a time (`.checksummer/lock`). A visible `.zfs` snapshot
+directory at the root is never walked.
 
 Exclude patterns (`init --exclude`, `config exclude a,b`) follow gitignore-like
 rules: `cache` or `*.tmp` match a name at any depth; `photos/raw` is anchored
@@ -73,7 +75,10 @@ counts them).
   restores without timestamps…), so `scan` reports *SUSPECTED CORRUPTION*,
   keeps the recorded hash, and `repair` restores the recorded content.
 * `repair` refuses to touch a file whose mtime differs from the index (it may
-  be a deliberate newer version); `scan` first.
+  be a deliberate newer version); `scan` first, or `accept` it.
+* Interrupting a long `scan`/`check` (Ctrl-C, reboot) is safe: committed
+  progress is kept and the next run continues; files are only recorded once
+  fully hashed.
 * A file that changes *while* it is being hashed is not recorded ("changed
   while scanning"); re-run `scan`.
 * Files whose directory could not be read (permissions, unmounted disk) are

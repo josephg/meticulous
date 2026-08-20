@@ -295,7 +295,9 @@ impl Writer {
         f.seek(SeekFrom::Start(self.header.table_offset()))?;
         f.write_all(&self.block_hashes)?;
         f.write_all(&self.header.algo.hash(&self.block_hashes))?;
-        f.sync_all()?;
+        // No fsync: sidecars are regenerable (parity sync) and every section is
+        // hashed, so a torn write after a crash is detected by fsck, and the
+        // per-file fsync would dominate scan time for many small files.
         drop(self.out);
         std::fs::rename(&self.tmp, &self.path)
             .with_context(|| format!("renaming {} -> {}", self.tmp.display(), self.path.display()))?;

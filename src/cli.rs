@@ -49,6 +49,10 @@ pub enum Command {
     /// Find added / removed / modified files and update the index.
     Scan(ScanArgs),
 
+    /// Accept the current on-disk content of files as the new truth (use after
+    /// `scan` reported SUSPECTED CORRUPTION for something you really did edit).
+    Accept(AcceptArgs),
+
     /// Rebuild damaged files from their Reed–Solomon parity.
     Repair(RepairArgs),
 
@@ -138,6 +142,14 @@ pub struct ScanArgs {
     #[arg(long)]
     pub no_parity: bool,
     /// Worker threads.
+    #[arg(short, long)]
+    pub jobs: Option<usize>,
+}
+
+#[derive(Args, Debug)]
+pub struct AcceptArgs {
+    /// Files (or directories: every flagged file under them) to accept.
+    pub paths: Vec<PathBuf>,
     #[arg(short, long)]
     pub jobs: Option<usize>,
 }

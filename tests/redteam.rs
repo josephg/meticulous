@@ -321,3 +321,55 @@ fn check_older_than_and_budget() {
     bin(root).args(["check", "--older-than", "1h"]).assert().success().stdout(predicates::str::contains("nothing to check"));
     bin(root).args(["check", "--budget", "1"]).assert().success().stdout(predicates::str::contains("checking 1 files"));
 }
+
+// Interrupted session: marker present + stale hash must be accepted and resumed, not refused.
+#[test]
+fn interrupted_session_resumes() {
+    let a = setup("exclude");
+    let root = &a.root;
+    bin(root).args(["scan", "-y"]).assert().success();
+    // Emulate: a later session committed work (DB changed) and died before refreshing the hash.
+    fs::write(root.join("d/new.bin"), b"new file").unwrap();
+    fs::write(root.join(".checksummer/index.sqlite.inprogress"), "123").unwrap();
+    let sha = root.join(".checksummer/index.sqlite.sha256");
+    let stale = fs::read_to_string(&sha).unwrap().replace('0', "1").replace('a', "b");
+    fs::write(&sha, stale).unwrap();
+    bin(root)
+        .args(["scan", "-y"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("previous checksummer run was interrupted"))
+        .stdout(predicates::str::contains("1 added"));
+    assert!(!root.join(".checksummer/index.sqlite.inprogress").exists());
+    // and now everything is consistent again
+    bin(root).arg("fsck").assert().success().stdout(predicates::str::contains("database file hash: ok"));
+    // a genuinely foreign modification (no marker) is still refused
+    fs::write(&sha, "deadbeef  index.sqlite\n").unwrap();
+    bin(root).args(["parity", "include", "d"]).assert().code(1).stderr(predicates::str::contains("refusing to write"));
+}
+
+// accept: explicit override for suspected corruption / flagged files
+#[test]
+fn accept_records_current_content() {
+    let a = setup("include");
+    let root = &a.root;
+    bin(root).args(["scan", "-y"]).assert().success();
+    flip(&root.join("d/f"), &[100, 5000], false);
+    bin(root).args(["scan", "-y"]).assert().code(2).stdout(predicates::str::contains("SUSPECTED CORRUPTION"));
+    let edited = fs::read(root.join("d/f")).unwrap();
+    bin(root).args(["accept", "d/f"]).assert().success().stdout(predicates::str::contains("accepted: d/f"));
+    assert_eq!(state_of(root, "d/f"), "ok");
+    bin(root).args(["check", "d/f"]).assert().success().stdout(predicates::str::contains("1 ok"));
+    assert_eq!(fs::read(root.join("d/f")).unwrap(), edited);
+    bin(root).args(["history", "d/f"]).assert().success().stdout(predicates::str::contains("accepted"));
+}
+
+// a visible ZFS snapshot dir at the root is never indexed
+#[test]
+fn zfs_snapshot_dir_skipped() {
+    let a = setup("exclude");
+    let root = &a.root;
+    fs::create_dir_all(root.join(".zfs/snapshot/daily/d")).unwrap();
+    fs::write(root.join(".zfs/snapshot/daily/d/f"), b"snapshot copy").unwrap();
+    bin(root).args(["scan", "-y"]).assert().success().stdout(predicates::str::contains(".zfs").not());
+}

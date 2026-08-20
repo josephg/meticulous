@@ -85,6 +85,12 @@ pub fn run(cli: Cli) -> Result<i32> {
         eprintln!("another checksummer is running on this archive; waiting for it to finish...");
     }
     let _guard = lock.write().context("waiting for archive lock")?;
+    // We hold the archive lock, so anything left in parity/tmp is from a dead run.
+    if let Ok(rd) = std::fs::read_dir(archive.parity_dir().join("tmp")) {
+        for e in rd.flatten() {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
     let db = Db::open(&archive.db_path())?;
     if db.hash_ok() == Some(false) {
         eprintln!(
@@ -97,6 +103,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         Command::Init(_) => unreachable!(),
         Command::Check(a) => check::check(&mut ctx, &a),
         Command::Scan(a) => scan::scan(&mut ctx, &a),
+        Command::Accept(a) => scan::accept(&mut ctx, &a),
         Command::Repair(a) => check::repair(&mut ctx, &a),
         Command::Parity(a) => parity::run(&mut ctx, &a),
         Command::Status => info::status(&mut ctx),
