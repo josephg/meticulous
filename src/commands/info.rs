@@ -2,7 +2,7 @@ use super::Ctx;
 use super::scan::sidecar_for;
 use crate::cli::{ConfigArgs, HistoryArgs, LsArgs};
 use crate::config::ParityMode;
-use crate::csp;
+use crate::mtp;
 use crate::db::State;
 use crate::marks::Resolver;
 use crate::util::{fmt_ago, fmt_bytes, fmt_opt_time, fmt_time, now, parse_duration, parse_parity, parse_size, path_display};
@@ -58,7 +58,7 @@ pub fn status(ctx: &mut Ctx) -> Result<()> {
         s.events,
         match db_hash_ok {
             Some(true) => "ok",
-            Some(false) => "MISMATCH (database changed outside checksummer or is damaged; run fsck)",
+            Some(false) => "MISMATCH (database changed outside meticulous or is damaged; run fsck)",
             None => "not recorded",
         }
     );
@@ -158,7 +158,7 @@ pub fn show(ctx: &mut Ctx, path: &Path) -> Result<()> {
         Some(c) if c.has_parity => {
             println!("parity:        yes ({})", if has_sidecar { sc_path.display().to_string() } else { "SIDECAR MISSING".to_string() });
             if has_sidecar {
-                match csp::Reader::open(&sc_path) {
+                match mtp::Reader::open(&sc_path) {
                     Ok(sc) => {
                         let l = sc.layout();
                         println!(

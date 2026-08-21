@@ -168,38 +168,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
-name = "checksummer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "blake3",
- "bytesize",
- "clap",
- "fd-lock",
- "globset",
- "hex",
- "humantime",
- "indicatif",
- "jiff",
- "libc",
- "md-5",
- "memmap2",
- "predicates",
- "rayon",
- "reed-solomon-simd",
- "rusqlite",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "tempfile",
- "thiserror",
- "toml",
- "walkdir",
-]
-
-[[package]]
 name = "clap"
 version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -707,6 +675,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "meticulous"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "blake3",
+ "bytesize",
+ "clap",
+ "fd-lock",
+ "globset",
+ "hex",
+ "humantime",
+ "indicatif",
+ "jiff",
+ "libc",
+ "md-5",
+ "memmap2",
+ "predicates",
+ "rayon",
+ "reed-solomon-simd",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "walkdir",
 ]
 
 [[package]]

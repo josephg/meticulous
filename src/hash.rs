@@ -1,4 +1,4 @@
-//! Hash algorithms. Every digest stored by checksummer is tagged with its algorithm.
+//! Hash algorithms. Every digest stored by meticulous is tagged with its algorithm.
 //!
 //! ZFS compatibility notes:
 //! * `fletcher4` is ZFS's default (`checksum=on`). Implemented here exactly as

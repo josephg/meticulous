@@ -87,7 +87,7 @@ pub fn check(ctx: &mut Ctx, args: &CheckArgs) -> Result<()> {
                 ctx.db.set_state(&row.path, State::Modified)?;
                 ctx.db.log_event(&row.path, "modified", Some("size/mtime changed since last scan; run `scan` to accept"))?;
             }
-            println!("modified: {} (mtime changed; run `checksummer scan` to accept or re-check)", path_display(&row.path));
+            println!("modified: {} (mtime changed; run `meticulous scan` to accept or re-check)", path_display(&row.path));
             sum.modified += 1;
             continue;
         }
@@ -117,7 +117,7 @@ pub fn check(ctx: &mut Ctx, args: &CheckArgs) -> Result<()> {
         // If the file changed while we were reading it, say so instead of judging stale bytes.
         if let Ok(m) = std::fs::metadata(&job.abs)
             && mtime_ns(&m) != row.mtime_ns {
-                println!("modified while checking: {} (run `checksummer scan`)", path_display(&row.path));
+                println!("modified while checking: {} (run `meticulous scan`)", path_display(&row.path));
                 sum.modified += 1;
                 return Ok(());
             }
@@ -156,7 +156,7 @@ pub fn check(ctx: &mut Ctx, args: &CheckArgs) -> Result<()> {
                     ctx.db.set_state(&row.path, State::Unrecoverable)?;
                 }
                 ctx.db.log_event(&row.path, "corrupt", Some(&format!("expected {} got {}; parity sidecar is damaged", hex::encode(&row.content_hash), hex::encode(&hash))))?;
-                println!("CORRUPT: {} (its parity sidecar is damaged too — run `checksummer fsck`)", path_display(&row.path));
+                println!("CORRUPT: {} (its parity sidecar is damaged too — run `meticulous fsck`)", path_display(&row.path));
                 sum.corrupt += 1;
                 sum.unrecoverable += 1;
             }
@@ -250,7 +250,7 @@ pub fn do_repair(ctx: &mut Ctx, row: &FileRow, precomputed: Option<parity::Block
     if mtime_ns(&meta) != row.mtime_ns {
         bail!(
             "refusing to repair {}: its mtime changed since the last scan ({} on disk vs {} recorded), so it may have been edited on purpose. \
-             If it is really damaged, `checksummer scan` will tell edits from corruption (it keeps the recorded content for suspected bit rot); otherwise run `scan` to accept the new content.",
+             If it is really damaged, `meticulous scan` will tell edits from corruption (it keeps the recorded content for suspected bit rot); otherwise run `scan` to accept the new content.",
             path_display(&row.path),
             crate::util::fmt_time(mtime_ns(&meta) / 1_000_000_000),
             crate::util::fmt_time(row.mtime_ns / 1_000_000_000)

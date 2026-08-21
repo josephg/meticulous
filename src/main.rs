@@ -1,7 +1,7 @@
 mod cli;
 mod commands;
 mod config;
-mod csp;
+mod mtp;
 mod db;
 mod hash;
 mod marks;

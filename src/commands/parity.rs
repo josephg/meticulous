@@ -43,7 +43,7 @@ fn mark(ctx: &mut Ctx, dirs: &[PathBuf], mode: Option<ParityMode>) -> Result<()>
             }
         }
     }
-    println!("run `checksummer parity sync` (or `scan`) to generate/prune parity accordingly");
+    println!("run `meticulous parity sync` (or `scan`) to generate/prune parity accordingly");
     Ok(())
 }
 
@@ -114,7 +114,7 @@ fn sync(ctx: &mut Ctx, prune: bool, jobs: Option<usize>) -> Result<()> {
     let mut corrupt = 0u64;
     let mut errors = 0u64;
     for r in &modified {
-        println!("skipped (changed since last scan; run `checksummer scan` first): {}", path_display(&r.path));
+        println!("skipped (changed since last scan; run `meticulous scan` first): {}", path_display(&r.path));
     }
     if need.is_empty() {
         println!("all covered files already have parity");

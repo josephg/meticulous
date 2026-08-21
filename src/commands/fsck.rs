@@ -3,7 +3,7 @@ use super::manifest::{MARKS_FILE, parse_manifest_line, parse_manifest_tsv_line};
 use super::scan::mtime_ns;
 use crate::cli::FsckArgs;
 use crate::config::ParityMode;
-use crate::csp;
+use crate::mtp;
 use crate::db::{ContentRow, Db, FileRow, State};
 use crate::parity;
 use crate::util::{now, path_display, path_from_bytes};
@@ -28,7 +28,7 @@ pub fn run(ctx: &mut Ctx, args: &FsckArgs) -> Result<()> {
             println!("  {l}");
         }
     }
-    // 2. recorded hashes of the .checksummer files (as of last close)
+    // 2. recorded hashes of the _meticulous files (as of last close)
     let db_path = ctx.archive.db_path();
     for (label, file) in [
         ("database file", db_path.clone()),
@@ -39,7 +39,7 @@ pub fn run(ctx: &mut Ctx, args: &FsckArgs) -> Result<()> {
         match crate::db::check_recorded_hash(&db_path, &file)? {
             Some(true) => println!("{label} hash: ok"),
             Some(false) => {
-                println!("{label} hash: MISMATCH — {} differs from what checksummer last wrote (damage, or modified externally)", file.display());
+                println!("{label} hash: MISMATCH — {} differs from what meticulous last wrote (damage, or modified externally)", file.display());
                 problems += 1;
             }
             None => println!("{label} hash: not recorded"),
@@ -66,7 +66,7 @@ pub fn run(ctx: &mut Ctx, args: &FsckArgs) -> Result<()> {
     let mut damaged = 0u64;
     let mut damaged_kept = 0u64;
     for c in &contents {
-        let p = csp::sidecar_path(&parity_dir, &c.hash);
+        let p = mtp::sidecar_path(&parity_dir, &c.hash);
         expected.insert(p.clone());
         if !p.is_file() {
             missing += 1;
@@ -81,7 +81,7 @@ pub fn run(ctx: &mut Ctx, args: &FsckArgs) -> Result<()> {
             }
             continue;
         }
-        let problems_here: Vec<String> = match csp::Reader::open(&p) {
+        let problems_here: Vec<String> = match mtp::Reader::open(&p) {
             Err(e) => vec![format!("{e:#}")],
             Ok(mut r) => {
                 if r.header.file_hash != c.hash {
@@ -119,10 +119,10 @@ pub fn run(ctx: &mut Ctx, args: &FsckArgs) -> Result<()> {
             if all_intact && !files.is_empty() {
                 let _ = std::fs::remove_file(&p);
                 ctx.db.set_has_parity(&c.hash, false)?;
-                println!("  removed (file(s) intact); run `checksummer parity sync` to regenerate");
+                println!("  removed (file(s) intact); run `meticulous parity sync` to regenerate");
             } else {
                 damaged_kept += 1;
-                println!("  KEPT: a file using this parity is itself damaged or missing; its intact stripes may still repair it (`checksummer repair`)");
+                println!("  KEPT: a file using this parity is itself damaged or missing; its intact stripes may still repair it (`meticulous repair`)");
             }
         }
     }
@@ -151,7 +151,7 @@ pub fn run(ctx: &mut Ctx, args: &FsckArgs) -> Result<()> {
         if args.fix && (missing + orphans + damaged - damaged_kept) > 0 { " (fixed)" } else { "" }
     );
     if missing + damaged > 0 && !args.fix {
-        println!("hint: `checksummer fsck --fix` clears missing/damaged parity for intact files, then `checksummer parity sync` regenerates it");
+        println!("hint: `meticulous fsck --fix` clears missing/damaged parity for intact files, then `meticulous parity sync` regenerates it");
     }
     if (missing + damaged + orphans > 0 && !args.fix) || damaged_kept > 0 {
         problems += 1;
@@ -212,8 +212,8 @@ fn rebuild(ctx: &mut Ctx) -> Result<()> {
         let rel = path_from_bytes(&pbytes);
         let abs = ctx.archive.abs(&rel);
         let meta = std::fs::metadata(&abs).ok().filter(|m| m.is_file());
-        let sc = csp::sidecar_path(&parity_dir, &hash);
-        let layout = csp::Reader::open(&sc).ok().map(|r| *r.layout());
+        let sc = mtp::sidecar_path(&parity_dir, &hash);
+        let layout = mtp::Reader::open(&sc).ok().map(|r| *r.layout());
         db.upsert_content(&ContentRow {
             hash: hash.clone(),
             algo,
@@ -272,7 +272,7 @@ fn rebuild(ctx: &mut Ctx) -> Result<()> {
         std::fs::rename(&db_path, &broken).context("moving broken database aside")?;
     }
     std::fs::rename(&tmp, &db_path)?;
-    println!("rebuilt: {n} files ({missing} missing on disk). All files are marked unverified; run `checksummer check`.");
+    println!("rebuilt: {n} files ({missing} missing on disk). All files are marked unverified; run `meticulous check`.");
     if unknown_meta > 0 {
         println!(
             "note: {unknown_meta} files were rebuilt without size/mtime (old MANIFEST.txt); `check` will report them as modified until `scan` re-accepts them"

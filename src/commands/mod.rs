@@ -27,7 +27,7 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    /// Convert CLI path args to archive-relative paths (must not be inside .checksummer/).
+    /// Convert CLI path args to archive-relative paths (must not be inside _meticulous/).
     pub fn rel_paths(&self, args: &[PathBuf]) -> Result<Vec<PathBuf>> {
         args.iter().map(|p| self.rel(p)).collect()
     }
@@ -77,12 +77,12 @@ pub fn run(cli: Cli) -> Result<i32> {
         return Ok(0);
     }
     let archive = Archive::discover(cli.root.as_deref())?;
-    // One checksummer at a time per archive (scan/check/fsck all write).
+    // One meticulous process at a time per archive (scan/check/fsck all write).
     let lock_file = std::fs::File::create(archive.lock_path())
         .with_context(|| format!("creating lock file {}", archive.lock_path().display()))?;
     let mut lock = fd_lock::RwLock::new(lock_file);
     if lock.try_write().is_err() {
-        eprintln!("another checksummer is running on this archive; waiting for it to finish...");
+        eprintln!("another meticulous process is running on this archive; waiting for it to finish...");
     }
     let _guard = lock.write().context("waiting for archive lock")?;
     // We hold the archive lock, so anything left in parity/tmp is from a dead run.
@@ -94,7 +94,7 @@ pub fn run(cli: Cli) -> Result<i32> {
     let db = Db::open(&archive.db_path())?;
     if db.hash_ok() == Some(false) {
         eprintln!(
-            "warning: {} does not match the hash checksummer last recorded for it (damaged, or modified externally). Read-only commands still work; run `checksummer fsck`.",
+            "warning: {} does not match the hash meticulous last recorded for it (damaged, or modified externally). Read-only commands still work; run `meticulous fsck`.",
             archive.db_path().display()
         );
     }

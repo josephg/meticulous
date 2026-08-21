@@ -1,10 +1,10 @@
-//! The `.csp` parity sidecar format ("checksummer parity"). See FORMAT.md.
+//! The `.mtp` parity sidecar format ("meticulous parity"). See FORMAT.md.
 //!
 //! All integers little-endian. `dl` = digest length of `algo`.
 //!
 //! ```text
 //! off  len  field
-//! 0    8    magic  "CSPARITY"
+//! 0    8    magic  "MTPARITY"
 //! 8    4    version (u32) = 1
 //! 12   1    algo id (see hash::Algo::id)
 //! 13   1    digest length dl
@@ -33,7 +33,7 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-pub const MAGIC: &[u8; 8] = b"CSPARITY";
+pub const MAGIC: &[u8; 8] = b"MTPARITY";
 pub const VERSION: u32 = 1;
 pub const FIXED_HEADER_LEN: usize = 40;
 /// reed-solomon-simd limit we stay under per stripe.
@@ -227,7 +227,7 @@ impl Writer {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension("csp.tmp");
+        let tmp = path.with_extension("mtp.tmp");
         let f = File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         let mut out = BufWriter::with_capacity(1 << 20, f);
         out.write_all(&header.encode())?;
@@ -410,7 +410,7 @@ fn read_up_to(f: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
 /// Path of the sidecar for a given content hash under the parity directory.
 pub fn sidecar_path(parity_dir: &Path, content_hash: &[u8]) -> PathBuf {
     let h = hex::encode(content_hash);
-    parity_dir.join(&h[0..2]).join(&h[2..4]).join(format!("{h}.csp"))
+    parity_dir.join(&h[0..2]).join(&h[2..4]).join(format!("{h}.mtp"))
 }
 
 #[cfg(test)]

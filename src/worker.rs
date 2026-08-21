@@ -1,6 +1,6 @@
 //! Parallel file-processing pool shared by scan / check / parity sync / import.
 
-use crate::csp::{self, Layout};
+use crate::mtp::{self, Layout};
 use crate::hash::Algo;
 use crate::parity::{self, BlockCheck};
 use crate::util::{fmt_bytes, path_display};
@@ -86,9 +86,9 @@ fn process(job_id: usize, abs: &Path, size: u64, work: &Work, s: &Settings) -> D
                 let layout = s.layout_for(size);
                 let tmp_dir = s.parity_dir.join("tmp");
                 std::fs::create_dir_all(&tmp_dir)?;
-                let tmp = tmp_dir.join(format!("{}-{}.csp", std::process::id(), job_id));
+                let tmp = tmp_dir.join(format!("{}-{}.mtp", std::process::id(), job_id));
                 let enc = parity::encode_file(abs, s.algo, layout, &tmp)?;
-                let final_path = csp::sidecar_path(&s.parity_dir, &enc.file_hash);
+                let final_path = mtp::sidecar_path(&s.parity_dir, &enc.file_hash);
                 if final_path.exists() {
                     // Same content already has parity (duplicate file).
                     let _ = std::fs::remove_file(&tmp);
@@ -101,7 +101,7 @@ fn process(job_id: usize, abs: &Path, size: u64, work: &Work, s: &Settings) -> D
                 Ok(Done::Hashed { hash: enc.file_hash, bytes: enc.bytes_read, layout: Some(layout) })
             }
             Work::CheckBlocks { sidecar } => {
-                let sc = match csp::Reader::open(sidecar) {
+                let sc = match mtp::Reader::open(sidecar) {
                     Ok(sc) if sc.table_ok() => sc,
                     _ => {
                         let (hash, _) = parity::hash_file(abs, s.algo)?;

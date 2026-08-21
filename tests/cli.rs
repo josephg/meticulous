@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn bin(root: &Path) -> Command {
-    let mut c = Command::cargo_bin("checksummer").unwrap();
+    let mut c = Command::cargo_bin("meticulous").unwrap();
     c.current_dir(root);
     c
 }
@@ -86,8 +86,8 @@ fn scan_check_repair_cycle() {
     assert!(line("foo/a/b/c.bin").contains("\"parity\":true"));
     assert!(line("foo/bar/zot.bin").contains("\"parity\":false"));
     assert!(line("other/small.txt").contains("\"parity\":false"));
-    assert!(root.join(".checksummer/MANIFEST.txt").is_file());
-    assert!(root.join(".checksummer/index.sqlite.bak").is_file());
+    assert!(root.join("_meticulous/MANIFEST.txt").is_file());
+    assert!(root.join("_meticulous/index.sqlite.bak").is_file());
 
     // clean check passes
     bin(root).arg("check").assert().success().stdout(predicates::str::contains("5 ok"));
@@ -174,7 +174,7 @@ fn parity_sync_and_prune_and_fsck() {
     // damage a sidecar -> fsck --deep notices; --fix removes it; sync regenerates
     bin(root).args(["parity", "include", "foo"]).assert().success();
     bin(root).args(["parity", "sync"]).assert().success();
-    let sc = walkdir::WalkDir::new(root.join(".checksummer/parity"))
+    let sc = walkdir::WalkDir::new(root.join("_meticulous/parity"))
         .into_iter()
         .flatten()
         .find(|e| e.file_type().is_file())
@@ -193,7 +193,7 @@ fn export_import_and_rebuild() {
     let a = setup();
     let root = &a.root;
     bin(root).args(["scan", "-y"]).assert().success();
-    let m = fs::read_to_string(root.join(".checksummer/MANIFEST.txt")).unwrap();
+    let m = fs::read_to_string(root.join("_meticulous/MANIFEST.txt")).unwrap();
     assert_eq!(m.lines().count(), 5);
     // manifest line is "<64 hex>  <path>"
     let first = m.lines().next().unwrap();
@@ -201,7 +201,7 @@ fn export_import_and_rebuild() {
 
     // import our own manifest back: all match
     bin(root)
-        .args(["import", ".checksummer/MANIFEST.txt", "--relative-to", "."])
+        .args(["import", "_meticulous/MANIFEST.txt", "--relative-to", "."])
         .assert()
         .success()
         .stdout(predicates::str::contains("5 match, 0 MISMATCH"));
@@ -221,12 +221,12 @@ fn export_import_and_rebuild() {
         .stdout(predicates::str::contains("1 match, 1 MISMATCH"));
 
     // rebuild the db from the manifest
-    let marks_before = fs::read_to_string(root.join(".checksummer/PARITY_MARKS.txt")).unwrap();
+    let marks_before = fs::read_to_string(root.join("_meticulous/PARITY_MARKS.txt")).unwrap();
     fs::remove_file(root.join("legacy.md5")).unwrap();
     bin(root).args(["fsck", "--rebuild-db"]).assert().success();
     bin(root).args(["scan", "-y"]).assert().success().stdout(predicates::str::contains("5 unchanged"));
     bin(root).arg("check").assert().success().stdout(predicates::str::contains("5 ok"));
-    let marks_after = fs::read_to_string(root.join(".checksummer/PARITY_MARKS.txt")).unwrap();
+    let marks_after = fs::read_to_string(root.join("_meticulous/PARITY_MARKS.txt")).unwrap();
     assert_eq!(marks_before, marks_after);
     bin(root).arg("status").assert().success().stdout(predicates::str::contains("5 ok"));
 }

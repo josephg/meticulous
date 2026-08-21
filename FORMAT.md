@@ -1,6 +1,6 @@
-# checksummer on-disk formats
+# meticulous on-disk formats
 
-Everything checksummer stores lives in `<archive>/.checksummer/`:
+Everything meticulous stores lives in `<archive>/_meticulous/`:
 
 | file | purpose |
 |---|---|
@@ -9,19 +9,19 @@ Everything checksummer stores lives in `<archive>/.checksummer/`:
 | `index.sqlite.bak`, `index.sqlite.sha256` | previous good copy of the index + sha256sum-format hashes of both |
 | `MANIFEST.txt` | `"<hex>  <path>"` for every indexed file — `b3sum -c` / `sha256sum -c` compatible (run from the archive root) |
 | `PARITY_MARKS.txt` | `mode<TAB>dir` lines; lets `fsck --rebuild-db` restore marks |
-| `parity/ab/cd/<hex>.csp` | parity sidecar for the content whose hash is `<hex>` |
+| `parity/ab/cd/<hex>.mtp` | parity sidecar for the content whose hash is `<hex>` |
 | `FORMAT.md` | this document |
 
 Paths are always relative to the archive root, stored as raw bytes.
 
-## `.csp` parity sidecar (version 1)
+## `.mtp` parity sidecar (version 1)
 
 All integers little-endian. `dl` = digest length of the algorithm (32 for
 blake3/sha256/sha512-256/fletcher4).
 
 ```
 off     len   field
-0       8     magic "CSPARITY"
+0       8     magic "MTPARITY"
 8       4     version = 1 (u32)
 12      1     algo id: 1=blake3 2=sha256 3=sha512-256 4=fletcher4 5=md5 6=sha1
 13      1     dl
@@ -58,6 +58,6 @@ minimum one parity block per stripe stays proportionate.
 
 ZFS checksums are per record (block pointer), cover the *compressed* on-disk
 bytes, and `checksum=on` means fletcher4. `zdb -ddddd <dataset> <inode>` shows
-them as `cksum=a:b:c:d`. checksummer's `fletcher4` reproduces ZFS's native
+them as `cksum=a:b:c:d`. meticulous's `fletcher4` reproduces ZFS's native
 (little-endian word) algorithm. ZFS's blake3/skein/edonr are salted per pool
 and cannot be reproduced outside the pool.

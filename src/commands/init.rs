@@ -15,7 +15,7 @@ pub fn run(args: &InitArgs, root_flag: Option<&Path>, quiet: bool) -> Result<()>
     let root = std::fs::canonicalize(&dir)?;
     let csdir = root.join(DIR_NAME);
     if csdir.join(crate::config::CONFIG_FILE).exists() {
-        bail!("{} is already a checksummer archive", root.display());
+        bail!("{} is already a meticulous archive", root.display());
     }
     let block_size = parse_size(&args.block_size)?;
     if block_size > u32::MAX as u64 {
@@ -48,7 +48,7 @@ pub fn run(args: &InitArgs, root_flag: Option<&Path>, quiet: bool) -> Result<()>
     db.finish()?;
     std::fs::write(csdir.join("FORMAT.md"), include_str!("../../FORMAT.md"))?;
     if !quiet {
-        println!("initialised checksummer archive at {}", root.display());
+        println!("initialised meticulous archive at {}", root.display());
         println!(
             "  algo={} block_size={} parity={}% parity_default={}",
             archive.config.algo,
@@ -56,7 +56,7 @@ pub fn run(args: &InitArgs, root_flag: Option<&Path>, quiet: bool) -> Result<()>
             archive.config.parity_percent(),
             archive.config.parity_default.name()
         );
-        println!("next: `checksummer parity include <dir>` to choose what gets parity, then `checksummer scan`");
+        println!("next: `meticulous parity include <dir>` to choose what gets parity, then `meticulous scan`");
     }
     Ok(())
 }

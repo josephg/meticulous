@@ -63,7 +63,7 @@ pub fn write_manifest(db: &Db, w: &mut dyn Write, _algo: Algo) -> Result<()> {
 /// Machine-readable companion to MANIFEST.txt used by `fsck --rebuild-db`:
 /// `hex<TAB>size<TAB>mtime_ns<TAB>state<TAB>escaped-path` for every file (missing included).
 pub fn write_manifest_tsv(db: &Db, w: &mut dyn Write) -> Result<()> {
-    writeln!(w, "# checksummer index export: hash\tsize\tmtime_ns\tstate\tpath (coreutils-escaped)")?;
+    writeln!(w, "# meticulous index export: hash\tsize\tmtime_ns\tstate\tpath (coreutils-escaped)")?;
     for f in db.files_under(Path::new(""))? {
         let (_, bytes) = escape_manifest_path(path_bytes(&f.path));
         write!(w, "{}\t{}\t{}\t{}\t", hex::encode(&f.content_hash), f.size, f.mtime_ns, f.state.name())?;
@@ -394,12 +394,12 @@ pub fn import(ctx: &mut Ctx, args: &ImportArgs) -> Result<()> {
         }
         ctx.db.commit()?;
         if added > 0 {
-            println!("note: files indexed from a foreign-algorithm list have no parity yet; run `checksummer parity sync`");
+            println!("note: files indexed from a foreign-algorithm list have no parity yet; run `meticulous parity sync`");
         }
     }
     println!("import complete: {ok} match, {mismatch} MISMATCH, {missing} missing, {added} newly indexed, {trusted} trusted, {errors} errors");
     if mismatch > 0 {
-        println!("note: mismatching files that were not yet indexed were left out; decide per file (restore from backup, or `checksummer scan` to index the current content)");
+        println!("note: mismatching files that were not yet indexed were left out; decide per file (restore from backup, or `meticulous scan` to index the current content)");
     }
     if mismatch > 0 || missing > 0 || errors > 0 {
         ctx.problems = true;

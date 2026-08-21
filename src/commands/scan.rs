@@ -1,6 +1,6 @@
 use super::Ctx;
 use crate::cli::{AcceptArgs, ScanArgs};
-use crate::csp;
+use crate::mtp;
 use crate::db::{ContentRow, FileRow, State};
 use crate::marks::Resolver;
 use crate::util::{confirm, fmt_bytes, now, path_display};
@@ -63,7 +63,7 @@ pub struct WalkReport {
 
 /// Walk the archive (or the given relative roots) yielding regular files.
 /// Symlinks are never followed and are counted, not indexed. Repair temp
-/// files (`*.csrepair.*`) are ignored.
+/// files (`*.mtrepair.*`) are ignored.
 pub fn walk(ctx: &Ctx, rels: &[PathBuf], mut f: impl FnMut(Entry) -> Result<()>) -> Result<WalkReport> {
     let exclude = ctx.archive.config.exclude_set()?;
     let csdir = ctx.archive.dir();
@@ -143,7 +143,7 @@ impl WalkReport {
 
 fn is_repair_temp(rel: &Path) -> bool {
     rel.file_name()
-        .map(|n| n.to_string_lossy().contains(".csrepair."))
+        .map(|n| n.to_string_lossy().contains(".mtrepair."))
         .unwrap_or(false)
 }
 
@@ -158,7 +158,7 @@ pub fn parity_map(ctx: &Ctx) -> Result<HashMap<Vec<u8>, bool>> {
     Ok(out)
 }
 
-pub fn content_row(settings: &Settings, hash: &[u8], size: u64, layout: Option<csp::Layout>) -> ContentRow {
+pub fn content_row(settings: &Settings, hash: &[u8], size: u64, layout: Option<mtp::Layout>) -> ContentRow {
     ContentRow {
         hash: hash.to_vec(),
         algo: settings.algo,
@@ -175,7 +175,7 @@ pub fn content_row(settings: &Settings, hash: &[u8], size: u64, layout: Option<c
 /// (e.g. it describes a corrupt version of a file) unless some content row claims it.
 pub fn discard_sidecar(ctx: &Ctx, hash: &[u8]) {
     if let Ok(None) = ctx.db.get_content(hash) {
-        let _ = std::fs::remove_file(csp::sidecar_path(&ctx.archive.parity_dir(), hash));
+        let _ = std::fs::remove_file(mtp::sidecar_path(&ctx.archive.parity_dir(), hash));
     }
 }
 
@@ -233,7 +233,7 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
                     unaccepted.push((e.rel.clone(), row.clone()));
                 } else {
                     let has_parity = pmap.get(&row.content_hash).copied().unwrap_or(false);
-                    let sc = csp::sidecar_path(&parity_dir, &row.content_hash);
+                    let sc = mtp::sidecar_path(&parity_dir, &row.content_hash);
                     if row.size == e.size && has_parity && sc.is_file() {
                         push(&mut jobs, Work::CheckBlocks { sidecar: sc }, Tag::ModifiedWithParity { old: row.clone() });
                     } else {
@@ -281,7 +281,7 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
         let rel = &job.rel;
         // Only record results for files that did not change while we read them.
         let settled = settled_metadata(&job.abs, seen_size, seen_mtime);
-        let record = |ctx: &mut Ctx, hash: &[u8], bytes: u64, layout: Option<csp::Layout>, old: Option<&FileRow>, state: State| -> Result<bool> {
+        let record = |ctx: &mut Ctx, hash: &[u8], bytes: u64, layout: Option<mtp::Layout>, old: Option<&FileRow>, state: State| -> Result<bool> {
             let Some((size, mtime, inode)) = settled else {
                 if layout.is_some() {
                     discard_sidecar(ctx, hash);
@@ -380,7 +380,7 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
                         Some(&format!("mtime changed but only {} of {} blocks differ (repairable) — treated as suspected corruption, not accepted", bc.bad_blocks.len(), bc.n_blocks)),
                     )?;
                     println!(
-                        "SUSPECTED CORRUPTION: {} — mtime changed but only {} of {} blocks differ; not accepted. `checksummer repair` restores the recorded content; if this really is an edit, `checksummer accept <file>` records the new content.",
+                        "SUSPECTED CORRUPTION: {} — mtime changed but only {} of {} blocks differ; not accepted. `meticulous repair` restores the recorded content; if this really is an edit, `meticulous accept <file>` records the new content.",
                         path_display(rel),
                         bc.bad_blocks.len(),
                         bc.n_blocks
@@ -432,7 +432,7 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
                         "CORRUPT: {} (content changed but mtime did not{}){}",
                         path_display(rel),
                         if reason == "size" { "; size differs" } else { "" },
-                        if has_parity { " — run `checksummer repair`" } else { " — no parity available" }
+                        if has_parity { " — run `meticulous repair`" } else { " — no parity available" }
                     );
                     sum.corrupt += 1;
                     ctx.problems = true;
@@ -678,5 +678,5 @@ pub fn accept(ctx: &mut Ctx, args: &AcceptArgs) -> Result<()> {
 }
 
 pub fn sidecar_for(ctx: &Ctx, hash: &[u8]) -> PathBuf {
-    csp::sidecar_path(&ctx.archive.parity_dir(), hash)
+    mtp::sidecar_path(&ctx.archive.parity_dir(), hash)
 }

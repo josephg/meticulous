@@ -228,11 +228,11 @@ impl Db {
         db.hash_ok = check_db_hash_file(path)?;
         db.interrupted = marker_path(path).exists();
         if db.hash_ok == Some(false) && db.interrupted {
-            // The previous checksummer run was interrupted after committing some
+            // The previous meticulous run was interrupted after committing some
             // work but before it could record the new hash. SQLite transactions are
             // atomic, so the file is consistent if it passes its own integrity check.
             if db.integrity_check()?.is_empty() {
-                eprintln!("note: the previous checksummer run was interrupted; the index is intact and will be picked up where it left off");
+                eprintln!("note: the previous meticulous run was interrupted; the index is intact and will be picked up where it left off");
                 db.hash_ok = None;
             }
         }
@@ -240,7 +240,7 @@ impl Db {
         match v.as_deref().map(|s| s.parse::<i64>()) {
             Some(Ok(SCHEMA_VERSION)) => {}
             Some(Ok(other)) => bail!("database schema version {other} is not supported by this build ({SCHEMA_VERSION})"),
-            _ => bail!("database {} has no schema version (damaged?); try `checksummer fsck`", path.display()),
+            _ => bail!("database {} has no schema version (damaged?); try `meticulous fsck`", path.display()),
         }
         // Apply any additive schema (CREATE IF NOT EXISTS is idempotent).
         db.conn.execute_batch(SCHEMA)?;
@@ -255,7 +255,7 @@ impl Db {
         Ok(Db { conn, path: path.to_path_buf(), dirty: false, hash_ok: None, backed_up: false, force: false, interrupted: false })
     }
 
-    /// Was the database file unchanged since checksummer last wrote it?
+    /// Was the database file unchanged since meticulous last wrote it?
     /// None = no record yet.
     pub fn hash_ok(&self) -> Option<bool> {
         self.hash_ok
@@ -265,7 +265,7 @@ impl Db {
     }
 
     /// Called before the first write of a session: refuse if the file does not
-    /// match its recorded hash (it was damaged or modified outside checksummer),
+    /// match its recorded hash (it was damaged or modified outside meticulous),
     /// otherwise copy it to `.bak` so `.bak` is always the previous good copy.
     fn before_write(&mut self) -> Result<()> {
         if self.backed_up {
@@ -273,8 +273,8 @@ impl Db {
         }
         if self.hash_ok == Some(false) && !self.force {
             bail!(
-                "refusing to write: {} does not match the hash checksummer recorded for it (damaged or edited externally). \
-                 Run `checksummer fsck`; restore from {} if it is intact, or `fsck --rebuild-db`.",
+                "refusing to write: {} does not match the hash meticulous recorded for it (damaged or edited externally). \
+                 Run `meticulous fsck`; restore from {} if it is intact, or `fsck --rebuild-db`.",
                 self.path.display(),
                 self.path.with_extension("sqlite.bak").display()
             );
@@ -661,7 +661,7 @@ pub fn write_db_hash_file(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Verify a file in `.checksummer/` against `index.sqlite.sha256`. Ok(None) if no record.
+/// Verify a file in `_meticulous/` against `index.sqlite.sha256`. Ok(None) if no record.
 pub fn check_recorded_hash(db_path: &Path, file: &Path) -> Result<Option<bool>> {
     let p = db_path.with_extension("sqlite.sha256");
     if !p.is_file() {

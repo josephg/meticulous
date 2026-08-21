@@ -4,14 +4,14 @@ use crate::hash::Algo;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
-/// checksummer — keep a bit-rot-resistant index of checksums (and optional
+/// meticulous — keep a bit-rot-resistant index of checksums (and optional
 /// Reed–Solomon parity) for an archive directory.
 ///
 /// All paths printed or accepted are relative to the archive root: the
-/// directory containing `.checksummer/`. The root is found by walking up from
+/// directory containing `_meticulous/`. The root is found by walking up from
 /// the current directory, or given with --root.
 #[derive(Parser, Debug)]
-#[command(name = "checksummer", version, about, long_about = None, propagate_version = true)]
+#[command(name = "meticulous", version, about, long_about = None, propagate_version = true)]
 pub struct Cli {
     /// Archive root (default: discovered from the current directory).
     #[arg(long, global = true, value_name = "DIR")]
@@ -39,7 +39,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Create a new archive: writes <DIR>/.checksummer/{config.toml,index.sqlite}.
+    /// Create a new archive: writes <DIR>/_meticulous/{config.toml,index.sqlite}.
     Init(InitArgs),
 
     /// Re-read files and verify their hashes (everything, or only under PATHS).
@@ -214,7 +214,7 @@ pub struct HistoryArgs {
 
 #[derive(Args, Debug)]
 pub struct ExportArgs {
-    /// Output file (default: stdout). `scan` always refreshes .checksummer/MANIFEST.txt.
+    /// Output file (default: stdout). `scan` always refreshes _meticulous/MANIFEST.txt.
     #[arg(short, long)]
     pub output: Option<PathBuf>,
     /// sum = "<hex>  <path>" (b3sum/sha256sum -c compatible), json = one object per line.

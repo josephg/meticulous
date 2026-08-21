@@ -1,4 +1,4 @@
-# checksummer red-team report
+# meticulous red-team report
 
 Scope: every file under `src/` and `tests/`, `README.md`, `FORMAT.md`, read in full; release binary built and exercised against throw-away archives under the scratchpad (`redteam/e*`). No source files were modified. `cargo test` passes (23 unit + 5 e2e) before and after.
 
@@ -17,9 +17,9 @@ Each finding: location, what is wrong, how it was confirmed (command + output ex
 
 Confirmed (E2c): 100 KB file with parity, scanned; then 4 bytes changed + mtime bumped (a legit edit):
 ```
-$ checksummer check d/f
-modified: d/f (size/mtime changed; run `checksummer scan` to accept)
-$ checksummer repair d/f
+$ meticulous check d/f
+modified: d/f (size/mtime changed; run `meticulous scan` to accept)
+$ meticulous repair d/f
 repaired: d/f (1 block(s) rebuilt)        # exit 0
 $ dd if=d/f bs=1 skip=10 count=4 | xxd -p
 e5ee084f                                   # the "EDIT" bytes are gone
@@ -35,9 +35,9 @@ The worker hashes the file, then `on_done` re-stats and stores the **post-hash**
 
 Confirmed (E3): 1.4 GiB file; a writer overwrites its first bytes 0.3 s into the scan:
 ```
-$ checksummer scan -y -q        # scan complete: 1 added
+$ meticulous scan -y -q        # scan complete: 1 added
 recorded: <hash of all-zero file> ; actual file now: d60636d5…
-$ checksummer check
+$ meticulous check
 CORRUPT: d/big (no parity available)
 ```
 Fix: use the pre-hash `Entry{size,mtime_ns}` for the row, re-stat after hashing and if either differs, do **not** record — re-queue once or report "changed while scanning" and leave the row alone. (The parity path already bails on size change via `encode_inner`, but still records the post-hash mtime.)
@@ -49,8 +49,8 @@ The manifest has no mtime/size. `rebuild` records `mtime_ns = current mtime`, `s
 
 Confirmed (E25):
 ```
-$ checksummer fsck --rebuild-db
-$ checksummer check --repair
+$ meticulous fsck --rebuild-db
+$ meticulous check --repair
 CORRUPT: d/f — 1 bad block(s) (repairable)
 repaired: d/f (1 block(s) rebuilt)     # user's edit gone
 ```
@@ -63,13 +63,13 @@ A directory that is EACCES, an unmounted mount point, a renamed directory, or a 
 
 Confirmed (E4):
 ```
-$ chmod 000 d/sub; checksummer scan -y
+$ chmod 000 d/sub; meticulous scan -y
 warning: IO error for operation on …/d/sub: Permission denied (os error 13)
 1 file(s) in the index no longer exist on disk:  d/sub/f
 scan complete: 1 removed, 0 unchanged
 sidecars after: 0          # was 1; d/sub/f still exists on disk
 ```
-and (Ed) `mv photos pictures; checksummer scan photos -y` → row + sidecar gone, "moved" not detected (pictures was outside the scanned PATH).
+and (Ed) `mv photos pictures; meticulous scan photos -y` → row + sidecar gone, "moved" not detected (pictures was outside the scanned PATH).
 
 Fix: (a) treat a walk error under a directory as "unknown", never "removed": remember failed directory prefixes and exclude known rows under them from the removed set (and bail/return exit 2); (b) never delete sidecars in the same run that removed the rows — keep sidecars for content that still exists on disk or defer pruning to `parity sync --prune`/`fsck --fix`; (c) if the PATH root does not exist, error out instead of walking an empty tree.
 
@@ -80,10 +80,10 @@ The README (§Parity details) promises "damage to a sidecar only loses the damag
 
 Confirmed (E6): block-64/stripe-4096 archive, file bad in stripe 0, sidecar damaged in stripe 4:
 ```
-$ checksummer check d          → CORRUPT: d/f — 1 bad block(s) (repairable)
-$ checksummer fsck --deep --fix → damaged sidecar …: stripe 4: … (hash mismatch)   (sidecar removed)
-$ checksummer repair d         → cannot repair d/f: no usable parity … No such file or directory
-$ checksummer parity sync      → CORRUPT: d/f (cannot generate parity for damaged content)
+$ meticulous check d          → CORRUPT: d/f — 1 bad block(s) (repairable)
+$ meticulous fsck --deep --fix → damaged sidecar …: stripe 4: … (hash mismatch)   (sidecar removed)
+$ meticulous repair d         → cannot repair d/f: no usable parity … No such file or directory
+$ meticulous parity sync      → CORRUPT: d/f (cannot generate parity for damaged content)
 ```
 Fix: before deleting a damaged sidecar, run `check_blocks` on each referencing file; if any file is not `ok`, try `repair_file` with the usable stripes first and keep the sidecar otherwise. Also, the fix loop runs `deep_check` on *all* sidecars (full parity read) even without `--deep`, and `.unwrap_or(true)` deletes on any open error — make deletion explicit per reported sidecar.
 
@@ -94,10 +94,10 @@ Design assumption "mtime changed ⇒ intentional edit" fails for the very common
 
 Confirmed (Ei): three files with parity; `touch` all three (mtime reset), flip one byte in f2:
 ```
-$ checksummer scan -y
+$ meticulous scan -y
 modified: d/f3 (content unchanged) / modified: d/f2 / modified: d/f1 (content unchanged)
 scan complete: 3 modified, 3 parity generated
-$ checksummer ls   → all three "ok … P"; check → 3 ok    # f2's old sidecar is gone
+$ meticulous ls   → all three "ok … P"; check → 3 ok    # f2's old sidecar is gone
 ```
 Fix: for a mtime-changed file whose content has parity, run `check_blocks` against the old sidecar first; if `bad_blocks.len() <= parity` (and especially if size is unchanged) report it as *suspected corruption* and ask (or require `--accept-corruption`) before accepting; never prune sidecars of content replaced in the same run without confirmation. Also do not re-encode parity for `Tag::Modified` files whose content hash is unchanged (they are re-encoded and the tmp sidecar discarded — wasted work, `scan.rs:161`).
 
@@ -122,9 +122,9 @@ Confirmed (E7): bytes 96..99 of the DB altered → `status: file hash MISMATCH`;
 `src/commands/scan.rs:54,78`. `follow_links(false)` + `is_file()` drops every symlink. For an archive where sub-trees live on other disks via symlinks, everything under them is silently unprotected.
 Confirmed (E11): `real/x` indexed; `d/link -> ../real` and `d/flink -> ../real/x` produce no output at all. Fix: count and report skipped symlinks in the summary; offer `--follow-symlinks` (with loop protection) or at least index symlinked regular files.
 
-### H5. `scan <path inside .checksummer>` indexes the parity store / manifest / DB as archive files
-`src/commands/scan.rs:64-67` only prunes when the walk *starts above* `.checksummer`; `util::to_relative` accepts `.checksummer/...`.
-Confirmed (E5): `scan -y .checksummer/parity` → `ok 744 B - .checksummer/parity/27/c8/….csp`. Those files then appear as "removed" on a later full scan. Fix: reject rel paths whose first component is `.checksummer` in `Ctx::rel_paths`/`walk`, and filter them from `known`.
+### H5. `scan <path inside _meticulous>` indexes the parity store / manifest / DB as archive files
+`src/commands/scan.rs:64-67` only prunes when the walk *starts above* `_meticulous`; `util::to_relative` accepts `_meticulous/...`.
+Confirmed (E5): `scan -y _meticulous/parity` → `ok 744 B - _meticulous/parity/27/c8/….mtp`. Those files then appear as "removed" on a later full scan. Fix: reject rel paths whose first component is `_meticulous` in `Ctx::rel_paths`/`walk`, and filter them from `known`.
 
 ### H6. `--no-accept-changes` state / `check` message for damaged block table; has_sidecar ⇒ `corrupt` even when nothing can repair it
 `src/worker.rs:515-521` falls back to a plain hash when the block table is damaged; `src/commands/check.rs:134-139` then labels the file `corrupt` (because `has_sidecar`) while printing "(no parity available)", logs "(no parity)", and does not queue it for repair. Confirmed (E13): `CORRUPT: d/f (no parity available)`, `ls` → `corrupt … P`. `repair` afterwards fails ("block table is damaged") and flips to unrecoverable. Fix: return a distinct `Done::HashedNoTable` / carry a flag so state is `unrecoverable` and the message says "sidecar damaged; run fsck".
@@ -145,10 +145,10 @@ By reading: if `on_done` returns `Err` (any rusqlite error, disk full, FK violat
 ## MEDIUM
 
 ### M1. `repair --dry-run` writes the whole repaired file to disk
-`src/parity.rs:224-227, 288-291`. The temp file is created/written/synced even for dry-run (help text: "without writing anything"). Confirmed (E14): on a read-only directory `repair --dry-run d/f` fails with `creating …/d/f.csrepair.<pid>: Permission denied`. Fix: for dry-run, decode into memory/hash only.
+`src/parity.rs:224-227, 288-291`. The temp file is created/written/synced even for dry-run (help text: "without writing anything"). Confirmed (E14): on a read-only directory `repair --dry-run d/f` fails with `creating …/d/f.mtrepair.<pid>: Permission denied`. Fix: for dry-run, decode into memory/hash only.
 
 ### M2. Repair temp files and `--keep-corrupt` copies live inside the archive and get indexed
-`src/parity.rs:306-325` (`<name>.csrepair.<pid>`, `<name>.corrupt`). A crash mid-repair leaves `x.csrepair.NNN`; `--keep-corrupt` leaves `x.corrupt`; the next `scan` indexes them as new files and (if covered) generates parity for corrupt content. Confirmed (E15): `ok 97.7 KiB P d/f.corrupt`. Fix: always exclude `*.csrepair.*` in `walk`; put kept copies under `.checksummer/quarantine/<path>` (or exclude `*.corrupt` by default and say so).
+`src/parity.rs:306-325` (`<name>.mtrepair.<pid>`, `<name>.corrupt`). A crash mid-repair leaves `x.mtrepair.NNN`; `--keep-corrupt` leaves `x.corrupt`; the next `scan` indexes them as new files and (if covered) generates parity for corrupt content. Confirmed (E15): `ok 97.7 KiB P d/f.corrupt`. Fix: always exclude `*.mtrepair.*` in `walk`; put kept copies under `_meticulous/quarantine/<path>` (or exclude `*.corrupt` by default and say so).
 
 ### M3. Repair breaks hard links and drops ownership
 `src/parity.rs:292-302`: `rename(tmp, path)` replaces the inode; other hard links keep the damaged bytes (each link is repaired separately, doubling space); `set_permissions` copies mode but not uid/gid (matters when run as root). Confirmed (E26): after repair `d/a links=1`, `d/b links=1`. Fix: if `nlink > 1`, write in place (`pwrite` only the bad blocks, after backing up) or warn; `fchown` when root.
@@ -163,10 +163,10 @@ By reading: if `on_done` returns `Err` (any rusqlite error, disk full, FK violat
 `src/config.rs:850-856` (globset defaults: `*` crosses `/`, no implicit `**/`). Confirmed (E23): `--exclude cache` excludes only top-level `cache/`, not `a/cache/`; `*.tmp` excludes at any depth. Document, or build with `literal_separator(true)` + auto-prefix `**/` for patterns without `/`.
 
 ### M7. `parity_blocks_for`/Layout ignore the configured stripe size when the block size is large (memory blow-up), and `Layout::choose` silently clamps config values
-`src/csp.rs:65-67`: `bps = max(cfg_stripe/bs, 64)` ⇒ with `block_size=16MiB` (ZFS recordsize-aligned configs, or `init --block-size 64MiB`) a stripe is 1–4 GiB per worker regardless of `--stripe-size`; `config set block_size 128MiB` is accepted by `validate()` but clamped to 64 MiB in `choose`. By reading. Fix: validate `block_size*64 <= stripe_size` and `block_size <= MAX_BLOCK_SIZE` in `Config::validate`; drop the `.max(64)` when it would exceed the configured stripe.
+`src/mtp.rs:65-67`: `bps = max(cfg_stripe/bs, 64)` ⇒ with `block_size=16MiB` (ZFS recordsize-aligned configs, or `init --block-size 64MiB`) a stripe is 1–4 GiB per worker regardless of `--stripe-size`; `config set block_size 128MiB` is accepted by `validate()` but clamped to 64 MiB in `choose`. By reading. Fix: validate `block_size*64 <= stripe_size` and `block_size <= MAX_BLOCK_SIZE` in `Config::validate`; drop the `.max(64)` when it would exceed the configured stripe.
 
 ### M8. `status`/`fsck` "ok" after concurrent writers; cross-process tmp/`fsck --fix` races
-`src/worker.rs:499-511` temp sidecars are per-pid/job (`parity/tmp/<pid>-<job>.csp`, plus `csp::Writer`'s `….csp.tmp`, `csp.rs:222`) — unique, fine — but `fsck --fix` deletes anything under `parity/tmp` or `*.tmp` (`fsck.rs:284-291`), so a concurrent `scan`/`parity sync` loses its in-progress sidecars (rename fails, counted as error; by reading). `protect_db_file` copies the DB while another process may be mid-transaction. Two concurrent scans "work" (E21) only because rusqlite's default 5 s busy timeout; both hash everything twice and log duplicate events. Fix: a lock file in `.checksummer/` (flock) taken by every writing command.
+`src/worker.rs:499-511` temp sidecars are per-pid/job (`parity/tmp/<pid>-<job>.mtp`, plus `mtp::Writer`'s `….mtp.tmp`, `mtp.rs:222`) — unique, fine — but `fsck --fix` deletes anything under `parity/tmp` or `*.tmp` (`fsck.rs:284-291`), so a concurrent `scan`/`parity sync` loses its in-progress sidecars (rename fails, counted as error; by reading). `protect_db_file` copies the DB while another process may be mid-transaction. Two concurrent scans "work" (E21) only because rusqlite's default 5 s busy timeout; both hash everything twice and log duplicate events. Fix: a lock file in `_meticulous/` (flock) taken by every writing command.
 
 ### M9. `check` marks files MISSING on any stat error (EACCES, EIO on the directory)
 `src/commands/check.rs:61-71`. Confirmed (E30): `chmod 000 d; check` → `MISSING: d/f`, state `missing`. A later `scan -y` would delete it (C4). Fix: distinguish `NotFound` from other errors; report the latter as errors without changing state.
@@ -181,10 +181,10 @@ By reading: if `on_done` returns `Err` (any rusqlite error, disk full, FK violat
 `fsck.rs:343-380`: no hash of MANIFEST.txt exists (`.sha256` only covers the DB), so a rotten hex digit becomes a wrong "truth" that can never be repaired (sidecar hash mismatch ⇒ "no usable parity"). Events are not preserved. Fix: add MANIFEST.txt to `index.sqlite.sha256` (or a `MANIFEST.txt.sha256`), verify before rebuild, and keep the old `event` table when the broken DB is still readable.
 
 ### M12. `Reader::open` loads the entire block hash table; `Header::stripe_offset` is O(n) per call
-`csp.rs:313-330, 164-170`. A 1 TiB file with 64 KiB blocks has a 512 MiB table, loaded per open (×4 workers in `check`, and sequentially for every sidecar in `fsck`); `deep_check`/`repair_file` call `stripe_offset` per stripe ⇒ O(stripes²) (only relevant for tiny block sizes). Fix: memory-map the sidecar (memmap2 is already a dependency) and precompute a stripe offset prefix array.
+`mtp.rs:313-330, 164-170`. A 1 TiB file with 64 KiB blocks has a 512 MiB table, loaded per open (×4 workers in `check`, and sequentially for every sidecar in `fsck`); `deep_check`/`repair_file` call `stripe_offset` per stripe ⇒ O(stripes²) (only relevant for tiny block sizes). Fix: memory-map the sidecar (memmap2 is already a dependency) and precompute a stripe offset prefix array.
 
 ### M13. SIGPIPE → panic
-`main.rs` does not reset SIGPIPE; `checksummer check | head -1` panics with `failed printing to stdout: Broken pipe` (seen in E2c/E12b). Fix: `libc::signal(SIGPIPE, SIG_DFL)` or handle `ErrorKind::BrokenPipe`.
+`main.rs` does not reset SIGPIPE; `meticulous check | head -1` panics with `failed printing to stdout: Broken pipe` (seen in E2c/E12b). Fix: `libc::signal(SIGPIPE, SIG_DFL)` or handle `ErrorKind::BrokenPipe`.
 
 ### M14. `scan` prompt default and `-y` semantics
 `util::confirm` returns `default=false` when stdin is not a TTY (safe), but `-y` is the documented non-interactive answer and — given C4/Ed — it is a foot-gun. Suggest `--remove-missing` as an explicit flag instead of overloading `-y`.
@@ -206,7 +206,7 @@ By reading: if `on_done` returns `Err` (any rusqlite error, disk full, FK violat
 - `info.rs::config`: `exclude` is comma-separated so globs containing `,` cannot be set; `algo` change is blocked on non-empty archive (good) but nothing stops `block_size` > 64 MiB (M7).
 - `util::to_relative`: a nonexistent `../x` argument normalises to `x` (the `root.join(arg)` candidate survives `strip_prefix`); harmless but odd.
 - `cli.rs` help: `repair --dry-run` says "without writing anything" (M1); `FsckArgs.fix` says "remove orphan sidecars" but also deletes damaged ones (C5); README says `.bak` is the "previous good copy" (H3).
-- Nested archives (a sub-directory with its own `.checksummer`) are indexed including their DB; only the root's `.checksummer` is skipped.
+- Nested archives (a sub-directory with its own `_meticulous`) are indexed including their DB; only the root's `_meticulous` is skipped.
 - `history PATH` uses `dir_bounds` prefix semantics (correct for dirs and exact files); `show` on a moved file says "not in the index" (expected).
 
 ---
@@ -222,7 +222,7 @@ Data safety / repair
 6. Partially damaged sidecar + corrupt file: `fsck --fix` must not delete the sidecar; `repair` must still succeed using the intact stripes (C5).
 7. mtime-reset + single-byte corruption: `scan` must flag suspected corruption and not prune the old sidecar (C6).
 8. `parity sync` on a modified file must not mark it corrupt (H2); with size change it must not error with "file grew".
-9. `--keep-corrupt`/crash leftovers (`*.csrepair.*`, `*.corrupt`) must not be indexed (M2).
+9. `--keep-corrupt`/crash leftovers (`*.mtrepair.*`, `*.corrupt`) must not be indexed (M2).
 10. Hard-linked pair: repair keeps them linked or warns (M3).
 11. `repair --dry-run` on a read-only directory must succeed and write nothing (M1).
 12. Concurrency: two `scan`s / `scan` + `fsck --fix` at once — no lost sidecars, no duplicate events (M8).
@@ -238,11 +238,11 @@ Parity engine (unit)
 
 Scan / manifest / import
 20. Non-UTF8 name and `a\nb` (literal backslash-n) round-trip through MANIFEST → rebuild → `ls` identical (M4/M5); `b3sum -c MANIFEST.txt` passes for them.
-21. `scan .checksummer/parity` (and `check`/`ls` with such paths) is rejected (H5).
+21. `scan _meticulous/parity` (and `check`/`ls` with such paths) is rejected (H5).
 22. Symlinked dir/file: summary reports N symlinks skipped (H4).
 23. Exclude semantics: `cache` vs `**/cache`, `*.tmp` at depth (M6) — pin whatever is decided.
 24. `import` MISMATCH on a new file: state after import is not `ok`, no parity generated (H7); BSD-style `MD5 (f) = hex` lines are counted as unparsed (currently they are, but untested).
-25. Error inside `on_done` (inject via a read-only `.checksummer` or a mock) → transaction rolled back, manifest not rewritten from uncommitted state (H8), later results reported (H9).
+25. Error inside `on_done` (inject via a read-only `_meticulous` or a mock) → transaction rolled back, manifest not rewritten from uncommitted state (H8), later results reported (H9).
 
 Existing-test weaknesses
 - `scan_check_repair_cycle` asserts only substrings of stdout (`"5 ok"`, `"repaired: foo/big.bin"`); it does check file bytes after repair (good) but never inspects `ls --json` state transitions for `corrupt → ok`, the event log, or exit code after `check --repair` (currently 0 — decide and assert).
@@ -270,18 +270,18 @@ data safety/correctness; each fix has a regression test in `tests/redteam.rs`.
 | H2 | fixed | `parity sync` stats first; modified files are skipped with a message (exit 2) |
 | H3 | fixed | `.bak` is copied *before* the first write of a session and only if the DB matches its recorded hash; a mismatching DB refuses writes (read-only commands warn) — `fsck --fix`/`--rebuild-db` are the escape hatches |
 | H4 | fixed | symlinks counted and reported in the scan summary (still not followed) |
-| H5 | fixed | paths inside `.checksummer/` are rejected by every command |
+| H5 | fixed | paths inside `_meticulous/` are rejected by every command |
 | H6 | fixed | `Done::HashedNoTable` → state `unrecoverable` with a "sidecar damaged, run fsck" message |
 | H7 | fixed | `import` leaves mismatching not-yet-indexed files unindexed (and discards any sidecar it produced) |
 | H8 | fixed | `commands::run` rolls back any open transaction before writing manifests/closing |
 | H9 | fixed | discarded results after the first error are counted and reported |
 | M1 | fixed | dry-run decodes into a sink, writes nothing |
-| M2 | fixed | `*.csrepair.*` ignored by the walk; `--keep-corrupt` moves originals to `.checksummer/quarantine/` |
+| M2 | fixed | `*.mtrepair.*` ignored by the walk; `--keep-corrupt` moves originals to `_meticulous/quarantine/` |
 | M3 | partial | hard links: warning printed; in-place repair not implemented |
 | M4/M5 | fixed | single-pass coreutils escaping over raw path bytes; manifest written as bytes |
 | M6 | fixed | gitignore-like exclude semantics (documented) |
 | M7 | fixed | `Config::validate` requires `stripe_size >= 64 × block_size` and `block_size <= 64 MiB`; `Layout::choose` never exceeds the configured stripe |
-| M8 | fixed | `flock` on `.checksummer/lock` for every command |
+| M8 | fixed | `flock` on `_meticulous/lock` for every command |
 | M9 | fixed | only `NotFound` marks a file missing; other stat errors are reported |
 | M10 | fixed | corrupt-without-parity → `unrecoverable` everywhere |
 | M11 | fixed | `index.sqlite.sha256` now covers MANIFEST.txt/.tsv/PARITY_MARKS; rebuild verifies its source |

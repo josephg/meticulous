@@ -1,7 +1,7 @@
 //! Single-pass file processing: whole-file hash, per-block hashes and
 //! Reed–Solomon parity generation; plus block verification and repair.
 
-use crate::csp::{Header, Layout, Reader, Writer};
+use crate::mtp::{Header, Layout, Reader, Writer};
 use crate::hash::Algo;
 use anyhow::{Context, Result, bail, ensure};
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
@@ -298,7 +298,7 @@ pub struct RepairOutcome {
 /// against the sidecar, then atomically renames it over the original
 /// (optionally keeping the damaged original as `<name>.corrupt`).
 /// `keep_corrupt`: where to move the damaged original (outside the scanned
-/// tree, e.g. `.checksummer/quarantine/...`) instead of deleting it.
+/// tree, e.g. `_meticulous/quarantine/...`) instead of deleting it.
 pub fn repair_file(path: &Path, sc: &mut Reader, check: &BlockCheck, keep_corrupt: Option<&Path>, dry_run: bool) -> Result<RepairOutcome> {
     let mut src_file = File::open(path)?;
     repair_file_from(&mut src_file, path, sc, check, keep_corrupt, dry_run)
@@ -311,7 +311,7 @@ pub fn repair_file_from(src: &mut dyn BlockSource, path: &Path, sc: &mut Reader,
     let bs = layout.block_size as usize;
     let expected_hash = sc.header.file_hash.clone();
 
-    let tmp_path = temp_sibling(path, ".csrepair");
+    let tmp_path = temp_sibling(path, ".mtrepair");
     // In dry-run mode nothing is written to disk: decode into a sink and only hash.
     let mut out: BufWriter<Box<dyn Write>> = if dry_run {
         BufWriter::new(Box::new(std::io::sink()))
@@ -460,7 +460,7 @@ mod tests {
         let data = pseudo(size, size as u32);
         let file = mk(dir.path(), "f.bin", &data);
         let layout = Layout::choose(size as u64, block, stripe, ppm);
-        let sc_path = dir.path().join("f.csp");
+        let sc_path = dir.path().join("f.mtp");
         let enc = encode_file(&file, Algo::Blake3, layout, &sc_path).unwrap();
         assert_eq!(enc.file_hash, Algo::Blake3.hash(&data));
         assert_eq!(enc.bytes_read, size as u64);
@@ -499,7 +499,7 @@ mod tests {
             let r0 = repair_file(&file, &mut sc, &c, None, true).unwrap();
             assert!(r0.blocks_repaired > 0);
             assert_eq!(std::fs::read(&file).unwrap(), before);
-            assert!(!dir.path().join("f.bin.csrepair").exists());
+            assert!(!dir.path().join("f.bin.mtrepair").exists());
             let q = dir.path().join("q/f.bin.corrupt");
             let r = repair_file(&file, &mut sc, &c, Some(&q), false).unwrap();
             assert!(r.blocks_repaired > 0);
@@ -559,7 +559,7 @@ mod tests {
         let data = pseudo(20_000, 21);
         let file = mk(dir.path(), "f", &data);
         let layout = Layout::choose(20_000, 64, 4096, 50_000); // 64 blocks/stripe, 4 parity
-        let sc_path = dir.path().join("f.csp");
+        let sc_path = dir.path().join("f.mtp");
         let enc = encode_file(&file, Algo::Blake3, layout, &sc_path).unwrap();
         let mut sc = Reader::open(&sc_path).unwrap();
         // ZFS-style: a 128-byte "record" (2 blocks) unreadable in stripe 0, one block in stripe 3
@@ -583,7 +583,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = mk(dir.path(), "e", b"");
         let layout = Layout::choose(0, 65536, 128 << 20, 50_000);
-        let sc_path = dir.path().join("e.csp");
+        let sc_path = dir.path().join("e.mtp");
         let enc = encode_file(&file, Algo::Sha256, layout, &sc_path).unwrap();
         assert_eq!(enc.file_hash, Algo::Sha256.hash(b""));
         let sc = Reader::open(&sc_path).unwrap();
@@ -597,7 +597,7 @@ mod tests {
         let data = pseudo(20_000, 9);
         let file = mk(dir.path(), "f", &data);
         let layout = Layout::choose(20_000, 64, 4096, 50_000);
-        let sc_path = dir.path().join("f.csp");
+        let sc_path = dir.path().join("f.mtp");
         encode_file(&file, Algo::Blake3, layout, &sc_path).unwrap();
         let mut sc = Reader::open(&sc_path).unwrap();
         let off = sc.header.stripe_offset(2) + 5;

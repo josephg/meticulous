@@ -1,8 +1,8 @@
-# checksummer
+# meticulous
 
 Keep a long-lived archive (backups, photos, music…) safe from bit rot:
-checksummer maintains an index of per-file checksums **inside the archive**
-(`<archive>/.checksummer/`), verifies files on demand, and — for the
+meticulous maintains an index of per-file checksums **inside the archive**
+(`<archive>/_meticulous/`), verifies files on demand, and — for the
 directories you choose — stores **Reed–Solomon parity** so a bounded amount of
 damage in each file can be *repaired*, not just detected.
 
@@ -14,7 +14,7 @@ damage in each file can be *repaired*, not just detected.
   or missing blocks per stripe are rebuildable, where `k` = number of parity
   blocks in that stripe. Which blocks are bad is known from per-block hashes.
 * Index: SQLite (`index.sqlite`) plus a plaintext `MANIFEST.txt` that
-  `b3sum -c` / `sha256sum -c` can verify without checksummer, a
+  `b3sum -c` / `sha256sum -c` can verify without meticulous, a
   `MANIFEST.tsv` (hash, size, mtime, state per file), a `.bak` copy of the
   database taken *before* each writing command, and an `index.sqlite.sha256`
   covering all of them. A database that no longer matches its recorded hash
@@ -27,16 +27,16 @@ damage in each file can be *repaired*, not just detected.
 cargo install --path .            # or cargo build --release
 
 cd /archive
-checksummer init                  # creates .checksummer/ (blake3, 64 KiB blocks, 5 % parity)
-checksummer parity include photos # subtrees of 'photos' get parity...
-checksummer parity exclude photos/2005/raw   # ...except this one (nearest mark wins)
-checksummer scan                  # hash everything, generate parity where covered
-checksummer check                 # later: re-read and verify everything
-checksummer check --repair        # verify and repair what parity allows
+meticulous init                  # creates _meticulous/ (blake3, 64 KiB blocks, 5 % parity)
+meticulous parity include photos # subtrees of 'photos' get parity...
+meticulous parity exclude photos/2005/raw   # ...except this one (nearest mark wins)
+meticulous scan                  # hash everything, generate parity where covered
+meticulous check                 # later: re-read and verify everything
+meticulous check --repair        # verify and repair what parity allows
 ```
 
 All paths printed/accepted are relative to the archive root (the directory
-holding `.checksummer/`); you can run commands from any subdirectory.
+holding `_meticulous/`); you can run commands from any subdirectory.
 
 ## Commands
 
@@ -54,8 +54,8 @@ holding `.checksummer/`); you can run commands from any subdirectory.
 | `fsck [--deep] [--fix] [--rebuild-db]` | check SQLite integrity, the database's own hash, every parity sidecar; rebuild the index from `MANIFEST.txt` |
 | `config [KEY [VALUE]]` | show/change settings |
 
-Global flags: `--root DIR`, `-q`, `--json`, `-y`, `-n`. Only one checksummer
-runs per archive at a time (`.checksummer/lock`). A visible `.zfs` snapshot
+Global flags: `--root DIR`, `-q`, `--json`, `-y`, `-n`. Only one meticulous
+process runs per archive at a time (`_meticulous/lock`). A visible `.zfs` snapshot
 directory at the root is never walked.
 
 Exclude patterns (`init --exclude`, `config exclude a,b`) follow gitignore-like
@@ -86,7 +86,7 @@ counts them).
   their parity on disk until `fsck --fix` deletes the orphans.
 * Repairs write a temp file, verify the whole-file hash, then atomically
   replace the original; `--keep-corrupt` moves the damaged original to
-  `.checksummer/quarantine/<path>`; `--dry-run` writes nothing.
+  `_meticulous/quarantine/<path>`; `--dry-run` writes nothing.
 
 ## Parity details
 
@@ -105,7 +105,7 @@ counts them).
 
 ZFS verifies every block's checksum on every read, so `scan`/`check` (which
 read every byte) are also a ZFS integrity check of each file: a block ZFS
-cannot heal makes the read fail with `EIO`, which checksummer reports as
+cannot heal makes the read fail with `EIO`, which meticulous reports as
 `READ ERROR` with a pointer to `zpool status -v` (and marks the file
 `unrecoverable` rather than recording a hash). Before the first scan it is worth
 running `zpool status -v` (and optionally a `zpool scrub`). Note ZFS can only
@@ -114,7 +114,7 @@ disks is invisible to it; use `import` with your old md5/sha1 lists for that.
 
 **When ZFS itself reports a corrupt file** (`EIO` on read, listed in
 `zpool status -v`): ZFS refuses to return the bad record but happily returns
-the rest. `checksummer check` reads around the bad records, counts them as
+the rest. `meticulous check` reads around the bad records, counts them as
 *unreadable* blocks, and if the file has parity `repair` (or `check --repair`)
 rebuilds them from the good blocks + parity, writing a fresh copy and renaming
 it over the damaged one. Afterwards run `zpool clear <pool>` (or a scrub) so
@@ -123,7 +123,7 @@ and must come from a backup/snapshot.
 
 ZFS's own checksums are per record, computed over the *compressed* on-disk
 bytes, `fletcher4` by default, and its blake3/skein/edonr are salted per pool.
-checksummer can hash with `--algo fletcher4|sha256|sha512-256` (ZFS's
+meticulous can hash with `--algo fletcher4|sha256|sha512-256` (ZFS's
 reproducible algorithms; `fletcher4` is not cryptographic) and `init` on a ZFS
 dataset defaults the block size to the recordsize, but record-by-record
 comparison against zdb is deliberately not implemented for now.

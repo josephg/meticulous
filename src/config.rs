@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const DIR_NAME: &str = ".checksummer";
+pub const DIR_NAME: &str = "_meticulous";
 pub const CONFIG_FILE: &str = "config.toml";
 pub const DB_FILE: &str = "index.sqlite";
 pub const MANIFEST_FILE: &str = "MANIFEST.txt";
@@ -77,13 +77,13 @@ impl Config {
     }
     pub fn save(&self, path: &Path) -> Result<()> {
         self.validate()?;
-        let header = "# checksummer archive configuration\n# block_size / stripe_size are bytes; parity_ppm is parts-per-million of data (50000 = 5%).\n\n";
+        let header = "# meticulous archive configuration\n# block_size / stripe_size are bytes; parity_ppm is parts-per-million of data (50000 = 5%).\n\n";
         std::fs::write(path, format!("{header}{}", toml::to_string_pretty(self)?))
             .with_context(|| format!("writing {}", path.display()))
     }
     pub fn validate(&self) -> Result<()> {
-        if self.block_size < 64 || !self.block_size.is_multiple_of(64) || self.block_size > crate::csp::MAX_BLOCK_SIZE {
-            bail!("block_size must be a multiple of 64 between 64 and {}", crate::csp::MAX_BLOCK_SIZE);
+        if self.block_size < 64 || !self.block_size.is_multiple_of(64) || self.block_size > crate::mtp::MAX_BLOCK_SIZE {
+            bail!("block_size must be a multiple of 64 between 64 and {}", crate::mtp::MAX_BLOCK_SIZE);
         }
         if self.stripe_size < self.block_size as u64 * 64 {
             bail!("stripe_size must be at least 64 × block_size ({} bytes)", self.block_size as u64 * 64);
@@ -172,7 +172,7 @@ impl Archive {
             Some(r) => {
                 let r = std::fs::canonicalize(r).with_context(|| format!("root {}", r.display()))?;
                 if !r.join(DIR_NAME).join(CONFIG_FILE).is_file() {
-                    bail!("{} is not a checksummer archive (no {DIR_NAME}/{CONFIG_FILE}); run `checksummer init`", r.display());
+                    bail!("{} is not a meticulous archive (no {DIR_NAME}/{CONFIG_FILE}); run `meticulous init`", r.display());
                 }
                 r
             }
@@ -189,7 +189,7 @@ impl Archive {
                 }
                 found.ok_or_else(|| {
                     anyhow::anyhow!(
-                        "no checksummer archive found in {} or any parent (looked for {DIR_NAME}/); run `checksummer init` or pass --root",
+                        "no meticulous archive found in {} or any parent (looked for {DIR_NAME}/); run `meticulous init` or pass --root",
                         cwd.display()
                     )
                 })?

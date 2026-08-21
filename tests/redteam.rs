@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 fn bin(root: &Path) -> Command {
-    let mut c = Command::cargo_bin("checksummer").unwrap();
+    let mut c = Command::cargo_bin("meticulous").unwrap();
     c.current_dir(root);
     c
 }
@@ -60,10 +60,10 @@ fn state_of(root: &Path, rel: &str) -> String {
 }
 
 fn sidecars(root: &Path) -> usize {
-    walkdir::WalkDir::new(root.join(".checksummer/parity"))
+    walkdir::WalkDir::new(root.join("_meticulous/parity"))
         .into_iter()
         .flatten()
-        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "csp"))
+        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "mtp"))
         .count()
 }
 
@@ -173,7 +173,7 @@ fn fsck_fix_keeps_parity_needed_for_repair() {
     // damage the file in stripe 0 (block 3) and the sidecar in stripe 10
     flip(&root.join("d/f"), &[3 * 64 + 1], true);
     let h = hex::encode(blake3::hash(&original).as_bytes());
-    let sc = root.join(format!(".checksummer/parity/{}/{}/{h}.csp", &h[0..2], &h[2..4]));
+    let sc = root.join(format!("_meticulous/parity/{}/{}/{h}.mtp", &h[0..2], &h[2..4]));
     assert!(sc.is_file());
     // stripe area begins after header (40+2*32) + table (1563*32+32); stripe = 4*64 parity + 32 hash.
     let stripe10 = 104 + 1563 * 32 + 32 + 10 * (4 * 64 + 32) + 5;
@@ -209,7 +209,7 @@ fn rebuild_db_preserves_metadata_and_odd_names() {
     bin(root).args(["ls", "--state", "missing"]).assert().success().stdout(predicates::str::is_empty());
     bin(root).args(["scan", "-y"]).assert().code(0).stdout(predicates::str::contains("0 added").or(predicates::str::contains("added").not()));
     // MANIFEST.txt is verifiable by sha256sum-style tools: line count matches files
-    let m = fs::read(root.join(".checksummer/MANIFEST.txt")).unwrap();
+    let m = fs::read(root.join("_meticulous/MANIFEST.txt")).unwrap();
     assert_eq!(m.split(|&b| b == b'\n').filter(|l| !l.is_empty()).count(), 6);
 }
 
@@ -219,13 +219,13 @@ fn damaged_db_is_not_written_or_backed_up() {
     let a = setup("exclude");
     let root = &a.root;
     bin(root).args(["scan", "-y"]).assert().success();
-    let db = root.join(".checksummer/index.sqlite");
+    let db = root.join("_meticulous/index.sqlite");
     let good = fs::read(&db).unwrap();
-    let bak_before = fs::read(root.join(".checksummer/index.sqlite.bak")).unwrap();
+    let bak_before = fs::read(root.join("_meticulous/index.sqlite.bak")).unwrap();
     // corrupt a byte deep in the file
     flip(&db, &[4096 + 100], true);
     bin(root).args(["parity", "include", "d"]).assert().code(1).stderr(predicates::str::contains("refusing to write"));
-    assert_eq!(fs::read(root.join(".checksummer/index.sqlite.bak")).unwrap(), bak_before);
+    assert_eq!(fs::read(root.join("_meticulous/index.sqlite.bak")).unwrap(), bak_before);
     bin(root).arg("fsck").assert().code(2).stdout(predicates::str::contains("database file hash: MISMATCH"));
     // restore and carry on
     fs::write(&db, good).unwrap();
@@ -245,13 +245,13 @@ fn parity_sync_skips_modified() {
     assert_eq!(state_of(root, "d/f"), "ok");
 }
 
-// H4 / H5 / M2 / M6: symlinks counted, .checksummer rejected, repair temps ignored, exclude semantics
+// H4 / H5 / M2 / M6: symlinks counted, _meticulous rejected, repair temps ignored, exclude semantics
 #[test]
 fn walk_rules() {
     let a = setup("exclude");
     let root = &a.root;
     std::os::unix::fs::symlink("f", root.join("d/link")).unwrap();
-    fs::write(root.join("d/x.csrepair.123"), b"leftover").unwrap();
+    fs::write(root.join("d/x.mtrepair.123"), b"leftover").unwrap();
     fs::create_dir_all(root.join("d/sub/cache")).unwrap();
     fs::write(root.join("d/sub/cache/c"), b"cached").unwrap();
     fs::write(root.join("d/t.tmp"), b"tmp").unwrap();
@@ -261,11 +261,11 @@ fn walk_rules() {
         .assert()
         .success()
         .stdout(predicates::str::contains("1 symlinks skipped"))
-        .stdout(predicates::str::contains("csrepair").not())
+        .stdout(predicates::str::contains("mtrepair").not())
         .stdout(predicates::str::contains("cache/c").not())
         .stdout(predicates::str::contains("t.tmp").not());
-    bin(root).args(["scan", ".checksummer/parity"]).assert().code(1).stderr(predicates::str::contains("never indexed"));
-    bin(root).args(["ls", ".checksummer"]).assert().code(1);
+    bin(root).args(["scan", "_meticulous/parity"]).assert().code(1).stderr(predicates::str::contains("never indexed"));
+    bin(root).args(["ls", "_meticulous"]).assert().code(1);
 }
 
 // H7: import never indexes a mismatching file as ok
@@ -330,17 +330,17 @@ fn interrupted_session_resumes() {
     bin(root).args(["scan", "-y"]).assert().success();
     // Emulate: a later session committed work (DB changed) and died before refreshing the hash.
     fs::write(root.join("d/new.bin"), b"new file").unwrap();
-    fs::write(root.join(".checksummer/index.sqlite.inprogress"), "123").unwrap();
-    let sha = root.join(".checksummer/index.sqlite.sha256");
+    fs::write(root.join("_meticulous/index.sqlite.inprogress"), "123").unwrap();
+    let sha = root.join("_meticulous/index.sqlite.sha256");
     let stale = fs::read_to_string(&sha).unwrap().replace('0', "1").replace('a', "b");
     fs::write(&sha, stale).unwrap();
     bin(root)
         .args(["scan", "-y"])
         .assert()
         .success()
-        .stderr(predicates::str::contains("previous checksummer run was interrupted"))
+        .stderr(predicates::str::contains("previous meticulous run was interrupted"))
         .stdout(predicates::str::contains("1 added"));
-    assert!(!root.join(".checksummer/index.sqlite.inprogress").exists());
+    assert!(!root.join("_meticulous/index.sqlite.inprogress").exists());
     // and now everything is consistent again
     bin(root).arg("fsck").assert().success().stdout(predicates::str::contains("database file hash: ok"));
     // a genuinely foreign modification (no marker) is still refused
