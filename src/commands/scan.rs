@@ -1,10 +1,11 @@
 use super::Ctx;
+use super::setops;
 use crate::cli::{AcceptArgs, ScanArgs};
-use crate::mtp;
 use crate::db::{ContentRow, FileRow, State};
 use crate::marks::Resolver;
+use crate::mts;
 use crate::util::{confirm, fmt_bytes, now, path_display};
-use crate::worker::{self, Done, Job, Settings, Work};
+use crate::worker::{self, Done, Job, SetMember, Settings, Work};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
@@ -13,13 +14,16 @@ use std::path::{Path, PathBuf};
 #[derive(Debug)]
 enum Tag {
     New,
+    /// A group of new covered files packed into one parity set: hashed and
+    /// encoded in a single read.
+    NewSet,
     /// size/mtime changed: re-hashed and accepted as an edit (unless it turns
     /// out to be corruption, see `Tag::ModifiedWithParity`).
     Modified { old: FileRow },
-    /// mtime changed but size is the same and the old content has parity:
-    /// block-check against the old sidecar first to tell edits from bit rot.
-    ModifiedWithParity { old: FileRow },
-    /// Existing, unchanged-looking file re-read to add parity / confirm it is back / confirm a size change.
+    /// mtime changed but size is the same and the old content is in a parity
+    /// set: block-check against the set sidecar first to tell edits from rot.
+    ModifiedWithParity { old: FileRow, set_id: Vec<u8> },
+    /// Existing, unchanged-looking file re-read to confirm it is back / confirm a size change.
     Recheck { row: FileRow, reason: &'static str },
 }
 
@@ -147,36 +151,8 @@ fn is_repair_temp(rel: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Map content hash -> has_parity for every content row.
-pub fn parity_map(ctx: &Ctx) -> Result<HashMap<Vec<u8>, bool>> {
-    let mut st = ctx.db.conn().prepare("SELECT hash, has_parity FROM content")?;
-    let mut out = HashMap::new();
-    for r in st.query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)? != 0)))? {
-        let (h, p) = r?;
-        out.insert(h, p);
-    }
-    Ok(out)
-}
-
-pub fn content_row(settings: &Settings, hash: &[u8], size: u64, layout: Option<mtp::Layout>) -> ContentRow {
-    ContentRow {
-        hash: hash.to_vec(),
-        algo: settings.algo,
-        size,
-        block_size: layout.map(|l| l.block_size),
-        blocks_per_stripe: layout.map(|l| l.blocks_per_stripe),
-        parity_ppm: layout.map(|l| l.parity_ppm),
-        has_parity: layout.is_some(),
-        created_at: now(),
-    }
-}
-
-/// Remove a sidecar that was generated for content we don't want to keep
-/// (e.g. it describes a corrupt version of a file) unless some content row claims it.
-pub fn discard_sidecar(ctx: &Ctx, hash: &[u8]) {
-    if let Ok(None) = ctx.db.get_content(hash) {
-        let _ = std::fs::remove_file(mtp::sidecar_path(&ctx.archive.parity_dir(), hash));
-    }
+pub fn content_row(settings: &Settings, hash: &[u8], size: u64) -> ContentRow {
+    ContentRow { hash: hash.to_vec(), algo: settings.algo, size, created_at: now() }
 }
 
 /// Re-stat after hashing: if the file changed underneath us, the hash we
@@ -196,12 +172,16 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
     let mut resolver = Resolver::new(ctx.db.marks()?, ctx.archive.config.parity_default);
     let known: HashMap<PathBuf, FileRow> =
         ctx.db.files_under_any(&rels)?.into_iter().map(|f| (f.path.clone(), f)).collect();
-    let pmap = parity_map(ctx)?;
+    let live = ctx.db.live_membership_map()?;
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut jobs: Vec<Job<(Tag, u64, i64)>> = Vec::new();
     let mut sum = Summary::default();
     let mut unaccepted: Vec<(PathBuf, FileRow)> = Vec::new();
     let parity_dir = ctx.archive.parity_dir();
+    // New covered files are packed into parity sets in walk order and hashed
+    // during the (single) encoding read.
+    let mut pending: Vec<SetMember> = Vec::new();
+    let mut pending_bytes = 0u64;
 
     ctx.say(format!(
         "scanning {} ...",
@@ -213,17 +193,53 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
         let push = |jobs: &mut Vec<Job<(Tag, u64, i64)>>, work: Work, tag: Tag| {
             jobs.push(Job { rel: e.rel.clone(), abs: e.abs.clone(), size: e.size, work, tag: (tag, e.size, e.mtime_ns) });
         };
+        let flush = |jobs: &mut Vec<Job<(Tag, u64, i64)>>, pending: &mut Vec<SetMember>, pending_bytes: &mut u64| {
+            if pending.is_empty() {
+                return;
+            }
+            let members = std::mem::take(pending);
+            let total = *pending_bytes;
+            *pending_bytes = 0;
+            jobs.push(Job {
+                rel: members[0].rel.clone(),
+                abs: members[0].abs.clone(),
+                size: total,
+                work: Work::EncodeSet { members },
+                tag: (Tag::NewSet, 0, 0),
+            });
+        };
         match known.get(&e.rel) {
-            None => push(&mut jobs, Work::Hash { parity: want_parity }, Tag::New),
+            None => {
+                if want_parity && e.size > 0 {
+                    if e.size >= settings.stripe_size {
+                        // A big file gets a solo, multi-stripe set.
+                        flush(&mut jobs, &mut pending, &mut pending_bytes);
+                        jobs.push(Job {
+                            rel: e.rel.clone(),
+                            abs: e.abs.clone(),
+                            size: e.size,
+                            work: Work::EncodeSet {
+                                members: vec![SetMember { rel: e.rel.clone(), abs: e.abs.clone(), size: e.size, mtime_ns: e.mtime_ns, expected_hash: None }],
+                            },
+                            tag: (Tag::NewSet, 0, 0),
+                        });
+                    } else {
+                        pending.push(SetMember { rel: e.rel.clone(), abs: e.abs.clone(), size: e.size, mtime_ns: e.mtime_ns, expected_hash: None });
+                        pending_bytes += e.size;
+                        if pending_bytes >= settings.stripe_size || pending.len() >= mts::MAX_MEMBERS as usize {
+                            flush(&mut jobs, &mut pending, &mut pending_bytes);
+                        }
+                    }
+                } else {
+                    push(&mut jobs, Work::Hash, Tag::New);
+                }
+            }
             Some(row) if row.mtime_ns == e.mtime_ns => {
-                let has_parity = pmap.get(&row.content_hash).copied().unwrap_or(false);
                 if row.size != e.size {
                     // Same mtime, different size: not an edit. Re-read to confirm corruption.
-                    push(&mut jobs, Work::Hash { parity: false }, Tag::Recheck { row: row.clone(), reason: "size" });
+                    push(&mut jobs, Work::Hash, Tag::Recheck { row: row.clone(), reason: "size" });
                 } else if row.state == State::Missing {
-                    push(&mut jobs, Work::Hash { parity: want_parity && !has_parity }, Tag::Recheck { row: row.clone(), reason: "reappeared" });
-                } else if want_parity && !has_parity && row.state == State::Ok {
-                    push(&mut jobs, Work::Hash { parity: true }, Tag::Recheck { row: row.clone(), reason: "parity" });
+                    push(&mut jobs, Work::Hash, Tag::Recheck { row: row.clone(), reason: "reappeared" });
                 } else {
                     sum.unchanged += 1;
                 }
@@ -232,18 +248,38 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
                 if args.no_accept_changes {
                     unaccepted.push((e.rel.clone(), row.clone()));
                 } else {
-                    let has_parity = pmap.get(&row.content_hash).copied().unwrap_or(false);
-                    let sc = mtp::sidecar_path(&parity_dir, &row.content_hash);
-                    if row.size == e.size && has_parity && sc.is_file() {
-                        push(&mut jobs, Work::CheckBlocks { sidecar: sc }, Tag::ModifiedWithParity { old: row.clone() });
-                    } else {
-                        push(&mut jobs, Work::Hash { parity: want_parity }, Tag::Modified { old: row.clone() });
+                    let membership = live.get(&row.content_hash);
+                    match membership {
+                        Some((sid, ord)) if row.size == e.size => {
+                            let sc = mts::sidecar_path(&parity_dir, sid);
+                            if sc.is_file() {
+                                push(
+                                    &mut jobs,
+                                    Work::CheckBlocks { sidecar: sc, ord: *ord as usize },
+                                    Tag::ModifiedWithParity { old: row.clone(), set_id: sid.clone() },
+                                );
+                            } else {
+                                push(&mut jobs, Work::Hash, Tag::Modified { old: row.clone() });
+                            }
+                        }
+                        _ => push(&mut jobs, Work::Hash, Tag::Modified { old: row.clone() }),
                     }
                 }
             }
         }
         Ok(())
     })?;
+    if !pending.is_empty() {
+        let members = std::mem::take(&mut pending);
+        let total = pending_bytes;
+        jobs.push(Job {
+            rel: members[0].rel.clone(),
+            abs: members[0].abs.clone(),
+            size: total,
+            work: Work::EncodeSet { members },
+            tag: (Tag::NewSet, 0, 0),
+        });
+    }
     sum.symlinks_skipped = report.symlinks_skipped;
     sum.walk_errors = report.failed_dirs.len() as u64;
 
@@ -262,18 +298,18 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
         ctx.problems = true;
     }
 
-    // Hash everything that needs hashing.
+    // Hash / encode everything that needs reading.
     let mut added_hashes: HashMap<Vec<u8>, PathBuf> = HashMap::new();
     let total_jobs = jobs.len();
     if total_jobs > 0 {
-        ctx.say(format!("hashing {} files ({})", total_jobs, fmt_bytes(jobs.iter().map(|j| j.size).sum())));
+        ctx.say(format!("reading {} job(s) ({})", total_jobs, fmt_bytes(jobs.iter().map(|j| j.size).sum())));
     }
     ctx.db.begin()?;
-    let mut pending = 0usize;
+    let mut pending_commits = 0usize;
     let settings2 = settings.clone();
     worker::run(jobs, &settings, |job, done| {
-        pending += 1;
-        if pending.is_multiple_of(500) {
+        pending_commits += 1;
+        if pending_commits.is_multiple_of(500) {
             ctx.db.commit()?;
             ctx.db.begin()?;
         }
@@ -281,14 +317,11 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
         let rel = &job.rel;
         // Only record results for files that did not change while we read them.
         let settled = settled_metadata(&job.abs, seen_size, seen_mtime);
-        let record = |ctx: &mut Ctx, hash: &[u8], bytes: u64, layout: Option<mtp::Layout>, old: Option<&FileRow>, state: State| -> Result<bool> {
+        let record = |ctx: &mut Ctx, hash: &[u8], bytes: u64, old: Option<&FileRow>, state: State| -> Result<bool> {
             let Some((size, mtime, inode)) = settled else {
-                if layout.is_some() {
-                    discard_sidecar(ctx, hash);
-                }
                 return Ok(false);
             };
-            ctx.db.upsert_content(&content_row(&settings2, hash, bytes, layout))?;
+            ctx.db.upsert_content(&content_row(&settings2, hash, bytes))?;
             let t = now();
             ctx.db.upsert_file(&FileRow {
                 id: old.map(|o| o.id).unwrap_or(0),
@@ -305,6 +338,60 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
             Ok(true)
         };
         match (tag, done) {
+            (Tag::NewSet, Done::SetEncoded(rep)) => {
+                for (m, msg, eio) in &rep.ejected {
+                    if *eio {
+                        ctx.read_error(&m.rel, msg);
+                    } else {
+                        println!("changed while scanning (not recorded, re-run scan): {}: {msg}", path_display(&m.rel));
+                        sum.changed_while_scanning += 1;
+                        continue;
+                    }
+                    sum.errors += 1;
+                }
+                if rep.set_id.is_empty() {
+                    return Ok(());
+                }
+                let mut dead = vec![false; rep.members.len()];
+                for (i, m) in rep.members.iter().enumerate() {
+                    let hash = &rep.member_hashes[i];
+                    let stl = settled_metadata(&m.abs, m.size, m.mtime_ns);
+                    let Some((size, mtime, inode)) = stl else {
+                        println!("changed while scanning (not recorded, re-run scan): {}", path_display(&m.rel));
+                        sum.changed_while_scanning += 1;
+                        dead[i] = true;
+                        continue;
+                    };
+                    ctx.db.upsert_content(&content_row(&settings2, hash, m.size))?;
+                    let t = now();
+                    ctx.db.upsert_file(&FileRow {
+                        id: 0,
+                        path: m.rel.clone(),
+                        content_hash: hash.clone(),
+                        size,
+                        mtime_ns: mtime,
+                        inode,
+                        state: State::Ok,
+                        added_at: t,
+                        updated_at: t,
+                        last_verified_at: Some(t),
+                    })?;
+                    ctx.db.log_event(&m.rel, "added", Some(&format!("{}:{}", settings2.algo, hex::encode(hash))))?;
+                    added_hashes.insert(hash.clone(), m.rel.clone());
+                    sum.added += 1;
+                    sum.added_bytes += m.size;
+                    sum.parity_added += 1;
+                    if !ctx.quiet {
+                        println!("added: {}", path_display(&m.rel));
+                    }
+                }
+                if dead.iter().all(|&d| d) {
+                    // Nothing usable in this set: drop the sidecar.
+                    let _ = std::fs::remove_file(&rep.sidecar);
+                } else {
+                    setops::insert_encoded_set(ctx, settings2.algo, &rep.layout, &rep.set_id, &rep.member_hashes, &dead)?;
+                }
+            }
             (_, Done::Failed(msg)) => {
                 eprintln!("error: {}: {msg}", path_display(rel));
                 sum.errors += 1;
@@ -312,26 +399,23 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
             (tag, Done::ReadError(msg)) => {
                 ctx.read_error(rel, &msg);
                 match tag {
-                    Tag::Recheck { row, .. } | Tag::Modified { old: row } | Tag::ModifiedWithParity { old: row } => {
+                    Tag::Recheck { row, .. } | Tag::Modified { old: row } | Tag::ModifiedWithParity { old: row, .. } => {
                         if row.state != State::Unrecoverable {
                             ctx.db.set_state(rel, State::Unrecoverable)?;
                         }
                         ctx.db.log_event(rel, "read-error", Some(&msg))?;
                     }
-                    Tag::New => {}
+                    Tag::New | Tag::NewSet => {}
                 }
                 sum.errors += 1;
             }
-            (Tag::New, Done::Hashed { hash, bytes, layout }) => {
-                if !record(ctx, &hash, bytes, layout, None, State::Ok)? {
+            (Tag::New, Done::Hashed { hash, bytes }) => {
+                if !record(ctx, &hash, bytes, None, State::Ok)? {
                     println!("changed while scanning (not recorded, re-run scan): {}", path_display(rel));
                     sum.changed_while_scanning += 1;
                     return Ok(());
                 }
                 ctx.db.log_event(rel, "added", Some(&format!("{}:{}", settings2.algo, hex::encode(&hash))))?;
-                if layout.is_some() {
-                    sum.parity_added += 1;
-                }
                 added_hashes.insert(hash, rel.clone());
                 sum.added += 1;
                 sum.added_bytes += bytes;
@@ -339,8 +423,8 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
                     println!("added: {}", path_display(rel));
                 }
             }
-            (Tag::Modified { old }, Done::Hashed { hash, bytes, layout }) => {
-                if !record(ctx, &hash, bytes, layout, Some(&old), State::Ok)? {
+            (Tag::Modified { old }, Done::Hashed { hash, bytes }) => {
+                if !record(ctx, &hash, bytes, Some(&old), State::Ok)? {
                     println!("changed while scanning (not recorded, re-run scan): {}", path_display(rel));
                     sum.changed_while_scanning += 1;
                     return Ok(());
@@ -351,17 +435,32 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
                     "modified",
                     Some(&if same { "metadata changed, content identical".to_string() } else { format!("{} -> {}", hex::encode(&old.content_hash), hex::encode(&hash)) }),
                 )?;
-                if layout.is_some() {
-                    sum.parity_added += 1;
-                }
                 sum.modified += 1;
                 println!("modified: {}{}", path_display(rel), if same { " (content unchanged)" } else { "" });
             }
-            (Tag::ModifiedWithParity { old }, Done::Blocks(bc)) => {
+            (Tag::ModifiedWithParity { old, .. }, Done::HashedNoTable { hash }) => {
+                // The set sidecar is damaged: cannot tell edit from rot per
+                // block; treat like a plain modification.
+                if !record(ctx, &hash, seen_size, Some(&old), State::Ok)? {
+                    sum.changed_while_scanning += 1;
+                    return Ok(());
+                }
+                ctx.db.log_event(rel, "modified", Some(&format!("{} -> {} (parity sidecar damaged; run fsck)", hex::encode(&old.content_hash), hex::encode(&hash))))?;
+                sum.modified += 1;
+                println!("modified: {} (note: its parity sidecar is damaged — run `meticulous fsck`)", path_display(rel));
+            }
+            (Tag::ModifiedWithParity { old, set_id }, Done::Blocks(bc)) => {
                 let Some((_size, mtime, inode)) = settled else {
                     println!("changed while scanning (not recorded, re-run scan): {}", path_display(rel));
                     sum.changed_while_scanning += 1;
                     return Ok(());
+                };
+                let margin_ok = match (ctx.db.get_parity_set(&set_id)?, ctx.db.set_members(&set_id)?) {
+                    (Some(set), members) if !members.is_empty() => {
+                        let ord = members.iter().position(|m| m.content_hash == old.content_hash).unwrap_or(0) as u32;
+                        setops::estimated_margin_ok(&set, &members, ord, &bc.bad_blocks).unwrap_or(false)
+                    }
+                    _ => false,
                 };
                 if bc.ok(&old.content_hash) {
                     // Only the timestamp changed (touch, cp without -p, ...): keep everything, update metadata.
@@ -369,15 +468,17 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
                     ctx.db.log_event(rel, "modified", Some("mtime changed, content identical"))?;
                     sum.modified += 1;
                     println!("modified: {} (content unchanged)", path_display(rel));
-                } else if bc.repairable() && !bc.bad_blocks.is_empty() {
-                    // A few blocks differ and the parity could fix them: far more likely bit rot
-                    // (plus a timestamp reset) than an edit. Do NOT accept; keep the old hash,
-                    // record the new mtime so `repair` can act on it.
-                    ctx.db.upsert_file(&FileRow { mtime_ns: mtime, inode, updated_at: now(), state: State::Corrupt, ..old.clone() })?;
+                } else if !bc.bad_blocks.is_empty() && (margin_ok || !bc.unreadable_blocks.is_empty()) && bc.bad_blocks.len() as u64 * 2 <= bc.n_blocks.max(1) {
+                    // A few blocks differ (or are unreadable) and the set's
+                    // margin looks sufficient: far more likely bit rot (plus a
+                    // timestamp reset) than an edit. Do NOT accept; keep the
+                    // old hash, record the new mtime so `repair` can act.
+                    let st = if margin_ok { State::Corrupt } else { State::Unrecoverable };
+                    ctx.db.upsert_file(&FileRow { mtime_ns: mtime, inode, updated_at: now(), state: st, ..old.clone() })?;
                     ctx.db.log_event(
                         rel,
                         "corrupt",
-                        Some(&format!("mtime changed but only {} of {} blocks differ (repairable) — treated as suspected corruption, not accepted", bc.bad_blocks.len(), bc.n_blocks)),
+                        Some(&format!("mtime changed but only {} of {} blocks differ ({}) — treated as suspected corruption, not accepted", bc.bad_blocks.len(), bc.n_blocks, if margin_ok { "likely repairable" } else { "beyond the estimated margin" })),
                     )?;
                     println!(
                         "SUSPECTED CORRUPTION: {} — mtime changed but only {} of {} blocks differ; not accepted. `meticulous repair` restores the recorded content; if this really is an edit, `meticulous accept <file>` records the new content.",
@@ -387,10 +488,20 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
                     );
                     sum.suspected += 1;
                     ctx.problems = true;
+                } else if bc.file_hash.is_empty() {
+                    // Unreadable blocks but classified as an edit: cannot hash
+                    // the new content; leave it for the next scan/check.
+                    ctx.read_error(rel, "file has unreadable blocks");
+                    if old.state != State::Unrecoverable {
+                        ctx.db.set_state(rel, State::Unrecoverable)?;
+                    }
+                    ctx.db.log_event(rel, "read-error", Some("unreadable blocks while classifying a modification"))?;
+                    sum.errors += 1;
                 } else {
-                    // Most blocks differ: a genuine edit. Accept with the hash we already have;
-                    // parity for the new content is generated on the next scan / parity sync.
-                    if !record(ctx, &bc.file_hash, bc.actual_size, None, Some(&old), State::Ok)? {
+                    // Most blocks differ: a genuine edit. Accept with the hash
+                    // we already have; parity for the new content is generated
+                    // by this scan's parity phase.
+                    if !record(ctx, &bc.file_hash, bc.actual_size, Some(&old), State::Ok)? {
                         sum.changed_while_scanning += 1;
                         return Ok(());
                     }
@@ -399,32 +510,20 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
                     println!("modified: {}", path_display(rel));
                 }
             }
-            (Tag::Recheck { row, reason }, Done::Hashed { hash, bytes, layout }) => {
+            (Tag::Recheck { row, reason }, Done::Hashed { hash, .. }) => {
                 if hash == row.content_hash {
                     if settled.is_none() {
-                        if layout.is_some() {
-                            discard_sidecar(ctx, &hash);
-                        }
                         sum.changed_while_scanning += 1;
                         return Ok(());
-                    }
-                    if let Some(l) = layout {
-                        ctx.db.upsert_content(&content_row(&settings2, &hash, bytes, Some(l)))?;
-                        sum.parity_added += 1;
                     }
                     ctx.db.set_verified(rel, now(), State::Ok)?;
                     if reason == "reappeared" {
                         ctx.db.log_event(rel, "reappeared", None)?;
                         println!("reappeared: {}", path_display(rel));
-                    } else if !ctx.quiet && layout.is_some() {
-                        println!("parity added: {}", path_display(rel));
                     }
                 } else {
                     // Unchanged mtime but different content: bit rot.
-                    if layout.is_some() {
-                        discard_sidecar(ctx, &hash);
-                    }
-                    let has_parity = pmap.get(&row.content_hash).copied().unwrap_or(false);
+                    let has_parity = ctx.db.live_membership_map()?.contains_key(&row.content_hash);
                     let st = if has_parity { State::Corrupt } else { State::Unrecoverable };
                     ctx.db.set_state(rel, st)?;
                     ctx.db.log_event(rel, "corrupt", Some(&format!("expected {} got {}", hex::encode(&row.content_hash), hex::encode(&hash))))?;
@@ -438,7 +537,7 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
                     ctx.problems = true;
                 }
             }
-            (_, Done::HashedNoTable { .. }) | (_, Done::Blocks(_)) | (_, Done::Hashed { .. }) => {
+            (_, Done::HashedNoTable { .. }) | (_, Done::Blocks(_)) | (_, Done::Hashed { .. }) | (_, Done::SetEncoded(_)) => {
                 eprintln!("internal: unexpected result for {}", path_display(rel));
                 sum.errors += 1;
             }
@@ -500,13 +599,22 @@ pub fn scan(ctx: &mut Ctx, args: &ScanArgs) -> Result<()> {
         }
     }
 
-    // Content rows nobody references any more (after modifications/removals)
-    // are dropped. Their sidecars are deliberately KEPT: `fsck` lists them as
-    // orphans and `fsck --fix` deletes them, so a mistaken removal can still be
-    // undone by re-adding the file (its parity will be picked up again).
+    // Content rows nobody references any more are dropped (their memberships
+    // go dead, which queues their sets for rebuild below).
     ctx.db.begin()?;
     ctx.db.prune_orphan_content()?;
     ctx.db.commit()?;
+
+    // Parity phase: pack new/re-homed contents into sets, rebuild degraded and
+    // underfull sets, converge duplicates, sweep orphan sidecars.
+    if !args.no_parity {
+        let phase = setops::parity_phase(ctx, &settings, &mut resolver)?;
+        phase.print(ctx.quiet);
+        if phase.had_problems() {
+            ctx.problems = true;
+        }
+        sum.errors += phase.errors;
+    }
 
     print_summary(&sum);
     if sum.errors > 0 || sum.changed_while_scanning > 0 {
@@ -536,7 +644,7 @@ fn print_summary(s: &Summary) {
         parts.push(format!("{} missing", s.missing));
     }
     if s.parity_added > 0 {
-        parts.push(format!("{} parity generated", s.parity_added));
+        parts.push(format!("{} added with parity", s.parity_added));
     }
     if s.corrupt > 0 {
         parts.push(format!("{} CORRUPT", s.corrupt));
@@ -560,48 +668,10 @@ fn print_summary(s: &Summary) {
     println!("scan complete: {}", parts.join(", "));
 }
 
-/// Used by `parity sync`: hash+parity jobs for covered files lacking parity.
-/// Files whose size/mtime no longer match the index are reported, not encoded
-/// (run `scan` first); the job carries the on-disk size so the layout is right.
-pub struct ParityPlan {
-    pub need: Vec<Job<FileRow>>,
-    pub uncovered_with_parity: Vec<FileRow>,
-    pub modified: Vec<FileRow>,
-}
-
-pub fn parity_jobs_for_rows(ctx: &mut Ctx, rows: Vec<FileRow>, resolver: &mut Resolver) -> Result<ParityPlan> {
-    let pmap = parity_map(ctx)?;
-    let mut need = Vec::new();
-    let mut uncovered_with_parity = Vec::new();
-    let mut modified = Vec::new();
-    for row in rows {
-        if row.state == State::Missing {
-            continue;
-        }
-        let covered = resolver.covers_file(&row.path);
-        let has = pmap.get(&row.content_hash).copied().unwrap_or(false);
-        if covered && !has {
-            if row.state != State::Ok {
-                continue; // corrupt/unrecoverable/modified: nothing to protect yet
-            }
-            let abs = ctx.archive.abs(&row.path);
-            match std::fs::metadata(&abs) {
-                Ok(m) if m.len() == row.size && mtime_ns(&m) == row.mtime_ns => {
-                    need.push(Job { rel: row.path.clone(), abs, size: row.size, work: Work::Hash { parity: true }, tag: row });
-                }
-                Ok(_) => modified.push(row),
-                Err(_) => {}
-            }
-        } else if !covered && has {
-            uncovered_with_parity.push(row);
-        }
-    }
-    Ok(ParityPlan { need, uncovered_with_parity, modified })
-}
-
 /// `accept PATHS`: re-hash the named files (or every non-ok file under the
-/// named directories) and record the on-disk content as the truth, with parity
-/// if covered. This is the explicit override for SUSPECTED CORRUPTION /
+/// named directories) and record the on-disk content as the truth. Parity for
+/// the accepted content is (re)generated by the next scan / parity sync.
+/// This is the explicit override for SUSPECTED CORRUPTION /
 /// modified-not-accepted / corrupt states when the user knows the content is right.
 pub fn accept(ctx: &mut Ctx, args: &AcceptArgs) -> Result<()> {
     if args.paths.is_empty() {
@@ -609,7 +679,6 @@ pub fn accept(ctx: &mut Ctx, args: &AcceptArgs) -> Result<()> {
     }
     let rels = ctx.rel_paths_existing(&args.paths)?;
     let settings = Settings::from_archive(&ctx.archive, args.jobs, ctx.quiet);
-    let mut resolver = Resolver::new(ctx.db.marks()?, ctx.archive.config.parity_default);
     let explicit: HashSet<PathBuf> = rels.iter().filter(|r| ctx.archive.abs(r).is_file()).cloned().collect();
     let rows = ctx.db.files_under_any(&rels)?;
     let mut jobs: Vec<Job<(FileRow, u64, i64)>> = Vec::new();
@@ -622,8 +691,7 @@ pub fn accept(ctx: &mut Ctx, args: &AcceptArgs) -> Result<()> {
         if !m.is_file() {
             continue;
         }
-        let parity = resolver.covers_file(&row.path);
-        jobs.push(Job { rel: row.path.clone(), abs, size: m.len(), work: Work::Hash { parity }, tag: (row, m.len(), mtime_ns(&m)) });
+        jobs.push(Job { rel: row.path.clone(), abs, size: m.len(), work: Work::Hash, tag: (row, m.len(), mtime_ns(&m)) });
     }
     if jobs.is_empty() {
         println!("nothing to accept");
@@ -636,13 +704,13 @@ pub fn accept(ctx: &mut Ctx, args: &AcceptArgs) -> Result<()> {
     worker::run(jobs, &settings, |job, done| {
         let (old, seen_size, seen_mtime) = job.tag;
         match done {
-            Done::Hashed { hash, bytes, layout } => {
+            Done::Hashed { hash, bytes } => {
                 let Some((size, mtime, inode)) = settled_metadata(&job.abs, seen_size, seen_mtime) else {
                     println!("changed while hashing (not accepted): {}", path_display(&job.rel));
                     errors += 1;
                     return Ok(());
                 };
-                ctx.db.upsert_content(&content_row(&s2, &hash, bytes, layout))?;
+                ctx.db.upsert_content(&content_row(&s2, &hash, bytes))?;
                 let t = now();
                 ctx.db.upsert_file(&FileRow {
                     content_hash: hash.clone(),
@@ -671,12 +739,11 @@ pub fn accept(ctx: &mut Ctx, args: &AcceptArgs) -> Result<()> {
     ctx.db.prune_orphan_content()?;
     ctx.db.commit()?;
     println!("accept complete: {accepted} accepted, {errors} errors");
+    if accepted > 0 {
+        println!("run `meticulous scan` (or `parity sync`) to regenerate parity for the accepted content");
+    }
     if errors > 0 {
         ctx.problems = true;
     }
     Ok(())
-}
-
-pub fn sidecar_for(ctx: &Ctx, hash: &[u8]) -> PathBuf {
-    mtp::sidecar_path(&ctx.archive.parity_dir(), hash)
 }

@@ -46,6 +46,10 @@ pub struct Config {
     pub stripe_size: u64,
     /// Parity amount in parts per million of data (50000 = 5%).
     pub parity_ppm: u32,
+    /// Minimum parity per stripe, in bytes (rounded up to whole blocks).
+    /// Set to the ZFS recordsize at init so one lost record is always within
+    /// the margin; 0 = no extra floor.
+    pub parity_min_bytes: u64,
     /// Whether unmarked directories store parity.
     pub parity_default: ParityMode,
     /// Glob patterns (relative to root) to skip.
@@ -61,6 +65,7 @@ impl Default for Config {
             block_size: 64 * 1024,
             stripe_size: 128 << 20,
             parity_ppm: 50_000,
+            parity_min_bytes: 0,
             parity_default: ParityMode::Exclude,
             exclude: vec![],
             jobs: 0,
@@ -82,14 +87,17 @@ impl Config {
             .with_context(|| format!("writing {}", path.display()))
     }
     pub fn validate(&self) -> Result<()> {
-        if self.block_size < 64 || !self.block_size.is_multiple_of(64) || self.block_size > crate::mtp::MAX_BLOCK_SIZE {
-            bail!("block_size must be a multiple of 64 between 64 and {}", crate::mtp::MAX_BLOCK_SIZE);
+        if self.block_size < 64 || !self.block_size.is_multiple_of(64) || self.block_size > crate::mts::MAX_BLOCK_SIZE {
+            bail!("block_size must be a multiple of 64 between 64 and {}", crate::mts::MAX_BLOCK_SIZE);
         }
         if self.stripe_size < self.block_size as u64 * 64 {
             bail!("stripe_size must be at least 64 × block_size ({} bytes)", self.block_size as u64 * 64);
         }
         if self.parity_ppm > 1_000_000 {
             bail!("parity_ppm must be <= 1000000");
+        }
+        if self.parity_min_bytes > self.stripe_size / 4 {
+            bail!("parity_min_bytes must be <= stripe_size / 4 ({} bytes)", self.stripe_size / 4);
         }
         if !self.algo.strong() {
             eprintln!(

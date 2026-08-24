@@ -26,19 +26,27 @@ pub fn run(args: &InitArgs, root_flag: Option<&Path>, quiet: bool) -> Result<()>
         block_size: block_size as u32,
         stripe_size: parse_size(&args.stripe_size)?,
         parity_ppm: parse_parity(&args.parity)?,
+        parity_min_bytes: 0,
         parity_default: args.parity_default,
         exclude: args.exclude.clone(),
         jobs: args.jobs,
     };
-    // On ZFS, align blocks with the dataset recordsize when it is larger than
-    // the requested block size so per-record comparison with zdb is possible.
-    if let Some(rs) = crate::zfs::recordsize_for(&root)
-        && rs > config.block_size && rs % 64 == 0 && args.block_size == "64KiB" {
+    // On ZFS: align blocks with the dataset recordsize when it is larger than
+    // the requested block size, and set the per-stripe parity floor to one
+    // record so a single dead record is always within the repair margin
+    // (per-set block sizes can shrink below the recordsize for small files).
+    if let Some(rs) = crate::zfs::recordsize_for(&root) {
+        if rs > config.block_size && rs % 64 == 0 && args.block_size == "64KiB" {
             config.block_size = rs;
             if !quiet {
                 println!("note: {} is on ZFS with recordsize {}; using that as block size", root.display(), rs);
             }
         }
+        config.parity_min_bytes = (rs as u64).min(config.stripe_size / 4);
+        if !quiet {
+            println!("note: minimum parity per stripe set to {} (one ZFS record)", crate::util::fmt_bytes(config.parity_min_bytes));
+        }
+    }
     config.validate()?;
     std::fs::create_dir_all(&csdir).with_context(|| format!("creating {}", csdir.display()))?;
     std::fs::create_dir_all(csdir.join(crate::config::PARITY_DIR))?;

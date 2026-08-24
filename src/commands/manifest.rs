@@ -4,7 +4,6 @@ use crate::cli::{ExportArgs, ImportArgs};
 use crate::config::Archive;
 use crate::db::{ContentRow, Db, FileRow, State};
 use crate::hash::Algo;
-use crate::marks::Resolver;
 use crate::util::{escape_manifest_path, now, path_bytes, path_display, unescape_manifest_path};
 use crate::worker::{self, Done, Job, Settings, Work};
 use anyhow::{Context, Result, bail};
@@ -107,9 +106,9 @@ pub fn export(ctx: &mut Ctx, args: &ExportArgs) -> Result<()> {
     match args.format.as_str() {
         "sum" => write_manifest(&ctx.db, &mut out, ctx.archive.config.algo)?,
         "json" => {
+            let live = ctx.db.live_membership_map()?;
             for f in ctx.db.files_under(Path::new(""))? {
-                let c = ctx.db.get_content(&f.content_hash)?;
-                let has_parity = c.map(|c| c.has_parity).unwrap_or(false);
+                let has_parity = live.contains_key(&f.content_hash);
                 writeln!(
                     out,
                     "{}",
@@ -208,7 +207,6 @@ pub fn import(ctx: &mut Ctx, args: &ImportArgs) -> Result<()> {
     ctx.say(format!("importing {} entries ({algo}) from {}{}", listed.len(), args.file.display(), if bad_lines > 0 { format!(", {bad_lines} unparsed lines") } else { String::new() }));
 
     let settings = Settings::from_archive(&ctx.archive, args.jobs, ctx.quiet);
-    let mut resolver = Resolver::new(ctx.db.marks()?, ctx.archive.config.parity_default);
     let (mut ok, mut mismatch, mut missing, mut added, mut trusted, mut errors) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     struct Tag {
         listed: Vec<u8>,
@@ -240,16 +238,7 @@ pub fn import(ctx: &mut Ctx, args: &ImportArgs) -> Result<()> {
             }
             if args.trust {
                 let t = now();
-                ctx.db.upsert_content(&ContentRow {
-                    hash: l.hash.clone(),
-                    algo,
-                    size: meta.len(),
-                    block_size: None,
-                    blocks_per_stripe: None,
-                    parity_ppm: None,
-                    has_parity: false,
-                    created_at: t,
-                })?;
+                ctx.db.upsert_content(&ContentRow { hash: l.hash.clone(), algo, size: meta.len(), created_at: t })?;
                 ctx.db.upsert_file(&FileRow {
                     id: 0,
                     path: l.rel.clone(),
@@ -266,8 +255,7 @@ pub fn import(ctx: &mut Ctx, args: &ImportArgs) -> Result<()> {
                 trusted += 1;
                 continue;
             }
-            let parity = resolver.covers_file(&l.rel);
-            jobs.push(Job { rel: l.rel.clone(), abs, size: meta.len(), work: Work::Hash { parity }, tag: Tag { listed: l.hash, existing } });
+            jobs.push(Job { rel: l.rel.clone(), abs, size: meta.len(), work: Work::Hash, tag: Tag { listed: l.hash, existing } });
         } else {
             // Foreign algorithm: must read the file to compare; also index it natively if new.
             foreign_jobs.push((l.rel, abs, l.hash));
@@ -284,14 +272,11 @@ pub fn import(ctx: &mut Ctx, args: &ImportArgs) -> Result<()> {
                 eprintln!("error: {}: {m}", path_display(&job.rel));
                 errors += 1;
             }
-            Done::HashedNoTable { .. } | Done::Blocks(_) => unreachable!(),
-            Done::Hashed { hash, bytes, layout } => {
+            Done::HashedNoTable { .. } | Done::Blocks(_) | Done::SetEncoded(_) => unreachable!(),
+            Done::Hashed { hash, bytes } => {
                 if hash != job.tag.listed {
                     println!("MISMATCH: {} (file is {}, list says {}) — left unindexed", path_display(&job.rel), hex::encode(&hash), hex::encode(&job.tag.listed));
                     mismatch += 1;
-                    if layout.is_some() {
-                        super::scan::discard_sidecar(ctx, &hash);
-                    }
                     return Ok(());
                 } else {
                     ok += 1;
@@ -299,16 +284,7 @@ pub fn import(ctx: &mut Ctx, args: &ImportArgs) -> Result<()> {
                 if job.tag.existing.is_none() {
                     let meta = std::fs::metadata(&job.abs)?;
                     let t = now();
-                    ctx.db.upsert_content(&ContentRow {
-                        hash: hash.clone(),
-                        algo: s2.algo,
-                        size: bytes,
-                        block_size: layout.map(|l| l.block_size),
-                        blocks_per_stripe: layout.map(|l| l.blocks_per_stripe),
-                        parity_ppm: layout.map(|l| l.parity_ppm),
-                        has_parity: layout.is_some(),
-                        created_at: t,
-                    })?;
+                    ctx.db.upsert_content(&ContentRow { hash: hash.clone(), algo: s2.algo, size: bytes, created_at: t })?;
                     ctx.db.upsert_file(&FileRow {
                         id: 0,
                         path: job.rel.clone(),
@@ -363,16 +339,7 @@ pub fn import(ctx: &mut Ctx, args: &ImportArgs) -> Result<()> {
                         None => {
                             let meta = std::fs::metadata(&abs)?;
                             let t = now();
-                            ctx.db.upsert_content(&ContentRow {
-                                hash: nat.clone(),
-                                algo: native,
-                                size: bytes,
-                                block_size: None,
-                                blocks_per_stripe: None,
-                                parity_ppm: None,
-                                has_parity: false,
-                                created_at: t,
-                            })?;
+                            ctx.db.upsert_content(&ContentRow { hash: nat.clone(), algo: native, size: bytes, created_at: t })?;
                             ctx.db.upsert_file(&FileRow {
                                 id: 0,
                                 path: rel.clone(),
@@ -393,9 +360,9 @@ pub fn import(ctx: &mut Ctx, args: &ImportArgs) -> Result<()> {
             }
         }
         ctx.db.commit()?;
-        if added > 0 {
-            println!("note: files indexed from a foreign-algorithm list have no parity yet; run `meticulous parity sync`");
-        }
+    }
+    if added + trusted > 0 {
+        println!("note: newly indexed files get parity at the next `meticulous scan` (or `parity sync`) if they are covered");
     }
     println!("import complete: {ok} match, {mismatch} MISMATCH, {missing} missing, {added} newly indexed, {trusted} trusted, {errors} errors");
     if mismatch > 0 {

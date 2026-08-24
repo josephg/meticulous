@@ -1,11 +1,11 @@
 use super::Ctx;
-use super::scan::{parity_jobs_for_rows, sidecar_for};
+use super::setops;
 use crate::cli::ParityCmd;
 use crate::config::ParityMode;
-use crate::db::{ContentRow, State};
+use crate::db::State;
 use crate::marks::Resolver;
-use crate::util::{fmt_bytes, now, path_display};
-use crate::worker::{self, Done, Settings};
+use crate::util::{fmt_bytes, path_display};
+use crate::worker::Settings;
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
@@ -64,11 +64,11 @@ fn list(ctx: &mut Ctx) -> Result<()> {
     // Coverage stats
     let mut resolver = Resolver::new(marks.clone(), ctx.archive.config.parity_default);
     let rows = ctx.db.files_under(Path::new(""))?;
-    let pmap = super::scan::parity_map(ctx)?;
+    let live = ctx.db.live_membership_map()?;
     let (mut cov_n, mut cov_b, mut have_n, mut have_b, mut stale_n) = (0u64, 0u64, 0u64, 0u64, 0u64);
     for r in rows.iter().filter(|r| r.state != State::Missing) {
         let covered = resolver.covers_file(&r.path);
-        let has = pmap.get(&r.content_hash).copied().unwrap_or(false);
+        let has = live.contains_key(&r.content_hash);
         if covered {
             cov_n += 1;
             cov_b += r.size;
@@ -89,6 +89,15 @@ fn list(ctx: &mut Ctx) -> Result<()> {
         fmt_bytes(have_b),
         if stale_n > 0 { format!("; {stale_n} have parity but are no longer covered (prune with `parity sync --prune`)") } else { String::new() }
     );
+    let sets = ctx.db.all_parity_sets()?;
+    let degraded = ctx.db.degraded_sets()?.len();
+    let underfull = sets.iter().filter(|s| s.data_bytes * 2 < ctx.archive.config.stripe_size).count();
+    println!(
+        "sets: {} ({} degraded, {} underfull)",
+        sets.len(),
+        degraded,
+        underfull
+    );
     if let Ok(bytes) = dir_size(&ctx.archive.parity_dir()) {
         println!("parity store: {}", fmt_bytes(bytes));
     }
@@ -108,97 +117,58 @@ pub fn dir_size(p: &Path) -> Result<u64> {
 fn sync(ctx: &mut Ctx, prune: bool, jobs: Option<usize>) -> Result<()> {
     let settings = Settings::from_archive(&ctx.archive, jobs, ctx.quiet);
     let mut resolver = Resolver::new(ctx.db.marks()?, ctx.archive.config.parity_default);
-    let rows = ctx.db.files_under(Path::new(""))?;
-    let super::scan::ParityPlan { need, uncovered_with_parity: uncovered, modified } = parity_jobs_for_rows(ctx, rows, &mut resolver)?;
-    let mut generated = 0u64;
-    let mut corrupt = 0u64;
-    let mut errors = 0u64;
-    for r in &modified {
-        println!("skipped (changed since last scan; run `meticulous scan` first): {}", path_display(&r.path));
+
+    let phase = setops::parity_phase(ctx, &settings, &mut resolver)?;
+    phase.print(ctx.quiet);
+    if phase.skipped_modified > 0 {
+        println!(
+            "{} file(s) skipped (changed since last scan; run `meticulous scan` first)",
+            phase.skipped_modified
+        );
     }
-    if need.is_empty() {
-        println!("all covered files already have parity");
-    } else {
-        println!("generating parity for {} files ({})", need.len(), fmt_bytes(need.iter().map(|j| j.size).sum()));
-        let s2 = settings.clone();
-        ctx.db.begin()?;
-        worker::run(need, &settings, |job, done| {
-            let row = job.tag;
-            match done {
-                Done::Failed(m) => {
-                    eprintln!("error: {}: {m}", path_display(&row.path));
-                    errors += 1;
-                }
-                Done::ReadError(m) => {
-                    ctx.read_error(&row.path, &m);
-                    ctx.db.set_state(&row.path, State::Unrecoverable)?;
-                    ctx.db.log_event(&row.path, "read-error", Some(&m))?;
-                    errors += 1;
-                }
-                Done::Hashed { hash, bytes, layout } => {
-                    if hash == row.content_hash {
-                        ctx.db.upsert_content(&ContentRow {
-                            hash: hash.clone(),
-                            algo: s2.algo,
-                            size: bytes,
-                            block_size: layout.map(|l| l.block_size),
-                            blocks_per_stripe: layout.map(|l| l.blocks_per_stripe),
-                            parity_ppm: layout.map(|l| l.parity_ppm),
-                            has_parity: true,
-                            created_at: now(),
-                        })?;
-                        ctx.db.set_verified(&row.path, now(), State::Ok)?;
-                        generated += 1;
-                    } else {
-                        // sidecar describes corrupt content: discard
-                        if ctx.db.get_content(&hash)?.is_none() {
-                            let _ = std::fs::remove_file(sidecar_for(ctx, &hash));
-                        }
-                        // Same size+mtime as recorded (checked before queueing) but different bytes: bit rot, no parity.
-                        ctx.db.set_state(&row.path, State::Unrecoverable)?;
-                        ctx.db.log_event(&row.path, "corrupt", Some("detected while generating parity; no parity available"))?;
-                        println!("CORRUPT: {} (content changed but mtime did not; cannot generate parity for damaged content)", path_display(&row.path));
-                        corrupt += 1;
-                    }
-                }
-                Done::Blocks(_) | Done::HashedNoTable { .. } => unreachable!(),
-            }
-            Ok(())
-        })?;
-        ctx.db.commit()?;
+
+    // Contents with live parity that no covered file references any more.
+    let live = ctx.db.live_membership_map()?;
+    let mut uncovered: Vec<Vec<u8>> = Vec::new();
+    for hash in live.keys() {
+        let refs = ctx.db.files_by_content(hash)?;
+        // Missing-state files still count: their content must stay restorable.
+        let still_wanted = refs.iter().any(|f| resolver.covers_file(&f.path));
+        if !still_wanted {
+            uncovered.push(hash.clone());
+        }
     }
     let mut pruned = 0u64;
     if !uncovered.is_empty() {
         if prune {
             ctx.db.begin()?;
-            // Only delete a sidecar if *no* covered file references the content.
-            let mut by_hash: std::collections::HashMap<Vec<u8>, ()> = Default::default();
-            for r in &uncovered {
-                by_hash.insert(r.content_hash.clone(), ());
-            }
-            for h in by_hash.keys() {
-                let refs = ctx.db.files_by_content(h)?;
-                if refs.iter().any(|f| f.state != State::Missing && resolver.covers_file(&f.path)) {
-                    continue;
-                }
-                let _ = std::fs::remove_file(sidecar_for(ctx, h));
-                ctx.db.set_has_parity(h, false)?;
+            for h in &uncovered {
+                ctx.db.mark_members_dead(h)?;
                 pruned += 1;
             }
+            // Sets whose members are now all dead get dropped; the rest are
+            // degraded and will be rebuilt (without the pruned contents) by
+            // the next scan/sync parity phase.
+            setops::converge_duplicates(ctx)?;
             ctx.db.commit()?;
-            println!("pruned parity for {pruned} content item(s)");
+            println!("pruned parity for {pruned} content item(s); the affected sets rebuild on the next scan/sync");
         } else {
             println!(
-                "{} file(s) have parity but are no longer covered; run `parity sync --prune` to delete it",
+                "{} content item(s) have parity but are no longer covered; run `parity sync --prune` to drop them",
                 uncovered.len()
             );
         }
     }
+    let sets = ctx.db.all_parity_sets()?;
     println!(
-        "parity sync complete: {generated} generated, {pruned} pruned, {corrupt} corrupt, {} skipped (modified), {errors} errors",
-        modified.len()
+        "parity sync complete: {} set(s) ({} degraded), {} built, {} adopted, {} dissolved, {pruned} pruned",
+        sets.len(),
+        ctx.db.degraded_sets()?.len(),
+        phase.built,
+        phase.adopted,
+        phase.dissolved
     );
-    if corrupt > 0 || errors > 0 || !modified.is_empty() {
+    if phase.had_problems() || phase.skipped_modified > 0 {
         ctx.problems = true;
     }
     Ok(())

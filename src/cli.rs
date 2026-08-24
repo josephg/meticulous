@@ -53,8 +53,13 @@ pub enum Command {
     /// `scan` reported SUSPECTED CORRUPTION for something you really did edit).
     Accept(AcceptArgs),
 
-    /// Rebuild damaged files from their Reed–Solomon parity.
+    /// Rebuild damaged files from their Reed–Solomon parity sets (a missing
+    /// file whose content is still covered is restored entirely).
     Repair(RepairArgs),
+
+    /// Delete files safely: rebuild the parity sets they belong to first
+    /// (without them), then delete them from disk and the index.
+    Rm(RmArgs),
 
     /// Manage which directories store parity, and synchronise parity data.
     #[command(subcommand)]
@@ -166,6 +171,19 @@ pub struct RepairArgs {
     pub dry_run: bool,
 }
 
+#[derive(Args, Debug)]
+pub struct RmArgs {
+    /// Files or directories (recursive) to delete. Must be indexed.
+    pub paths: Vec<PathBuf>,
+    /// Delete even when an affected parity set cannot be rebuilt first
+    /// (because another member awaits repair); leaves that set degraded.
+    #[arg(long)]
+    pub force: bool,
+    /// Worker threads for the parity rebuild.
+    #[arg(short, long)]
+    pub jobs: Option<usize>,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum ParityCmd {
     /// Mark directories as storing parity (their subtrees inherit).
@@ -255,7 +273,7 @@ pub struct FsckArgs {
 
 #[derive(Args, Debug)]
 pub struct ConfigArgs {
-    /// Key to show/set (algo, block_size, stripe_size, parity, parity_default, exclude, jobs).
+    /// Key to show/set (algo, block_size, stripe_size, parity, parity_min_bytes, parity_default, exclude, jobs).
     pub key: Option<String>,
     /// New value.
     pub value: Option<String>,

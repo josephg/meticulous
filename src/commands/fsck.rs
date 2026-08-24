@@ -3,10 +3,10 @@ use super::manifest::{MARKS_FILE, parse_manifest_line, parse_manifest_tsv_line};
 use super::scan::mtime_ns;
 use crate::cli::FsckArgs;
 use crate::config::ParityMode;
-use crate::mtp;
-use crate::db::{ContentRow, Db, FileRow, State};
+use crate::db::{ContentRow, Db, FileRow, MemberRow, SetRow, State};
+use crate::mts;
 use crate::parity;
-use crate::util::{now, path_display, path_from_bytes};
+use crate::util::{now, path_from_bytes};
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
@@ -57,35 +57,38 @@ pub fn run(ctx: &mut Ctx, args: &FsckArgs) -> Result<()> {
         ctx.db.allow_write_despite_hash_mismatch();
     }
 
-    // 3. parity store
-    let contents = ctx.db.all_parity_contents()?;
+    // 3. parity store: one sidecar per parity_set row.
+    let sets = ctx.db.all_parity_sets()?;
     let parity_dir = ctx.archive.parity_dir();
     let tmp_dir = parity_dir.join("tmp");
     let mut expected: HashSet<PathBuf> = HashSet::new();
     let mut missing = 0u64;
     let mut damaged = 0u64;
     let mut damaged_kept = 0u64;
-    for c in &contents {
-        let p = mtp::sidecar_path(&parity_dir, &c.hash);
+    for set in &sets {
+        let p = mts::sidecar_path(&parity_dir, &set.id);
         expected.insert(p.clone());
+        let members = ctx.db.set_members(&set.id)?;
         if !p.is_file() {
             missing += 1;
-            let files = ctx.db.files_by_content(&c.hash)?;
             println!(
-                "missing sidecar for {} ({})",
-                hex::encode(&c.hash),
-                files.iter().map(|f| path_display(&f.path)).collect::<Vec<_>>().join(", ")
+                "missing sidecar for set {} ({} member(s))",
+                hex::encode(&set.id),
+                members.iter().filter(|m| !m.dead).count()
             );
             if args.fix {
-                ctx.db.set_has_parity(&c.hash, false)?;
+                // Drop the set rows: the members rejoin the pool at the next
+                // scan / parity sync and get freshly encoded.
+                ctx.db.delete_parity_set(&set.id)?;
+                println!("  removed the set from the index; run `meticulous scan` (or `parity sync`) to re-encode its members");
             }
             continue;
         }
-        let problems_here: Vec<String> = match mtp::Reader::open(&p) {
+        let problems_here: Vec<String> = match mts::Reader::open(&p) {
             Err(e) => vec![format!("{e:#}")],
             Ok(mut r) => {
-                if r.header.file_hash != c.hash {
-                    vec!["sidecar is for a different content hash".into()]
+                if let Err(e) = super::setops::verify_sidecar_matches(set, &members, &r) {
+                    vec![format!("{e:#}")]
                 } else if args.deep {
                     r.deep_check()?
                 } else if !r.table_ok() {
@@ -101,32 +104,39 @@ pub fn run(ctx: &mut Ctx, args: &FsckArgs) -> Result<()> {
         damaged += 1;
         println!("damaged sidecar {}: {}", p.display(), problems_here.join("; "));
         if args.fix {
-            // Only discard damaged parity if every file using it is intact, so
-            // `parity sync` can regenerate it. Otherwise the undamaged stripes
-            // may still be the only thing that can repair a damaged file: keep it.
-            let files = ctx.db.files_by_content(&c.hash)?;
+            // Only discard damaged parity if every live member's files are
+            // intact, so the next scan can regenerate the set. Otherwise its
+            // undamaged stripes may be the only thing that can repair a
+            // damaged member: keep it.
             let mut all_intact = true;
-            for f in files.iter().filter(|f| f.state != State::Missing) {
-                let abs = ctx.archive.abs(&f.path);
-                match parity::hash_file(&abs, c.algo) {
-                    Ok((h, _)) if h == c.hash => {}
-                    _ => {
-                        all_intact = false;
+            'members: for m in members.iter().filter(|m| !m.dead) {
+                let files = ctx.db.files_by_content(&m.content_hash)?;
+                let mut member_ok = false;
+                for f in files.iter().filter(|f| f.state != State::Missing) {
+                    let abs = ctx.archive.abs(&f.path);
+                    if let Ok((h, _)) = parity::hash_file(&abs, set.algo)
+                        && h == m.content_hash
+                    {
+                        member_ok = true;
                         break;
                     }
                 }
+                if !member_ok {
+                    all_intact = false;
+                    break 'members;
+                }
             }
-            if all_intact && !files.is_empty() {
+            if all_intact {
                 let _ = std::fs::remove_file(&p);
-                ctx.db.set_has_parity(&c.hash, false)?;
-                println!("  removed (file(s) intact); run `meticulous parity sync` to regenerate");
+                ctx.db.delete_parity_set(&set.id)?;
+                println!("  removed (every member intact); run `meticulous scan` (or `parity sync`) to regenerate");
             } else {
                 damaged_kept += 1;
-                println!("  KEPT: a file using this parity is itself damaged or missing; its intact stripes may still repair it (`meticulous repair`)");
+                println!("  KEPT: a member of this set is itself damaged or missing; the intact stripes may still repair it (`meticulous repair`)");
             }
         }
     }
-    // orphans: sidecars for content no longer in the index (e.g. after removals), and stale temp files
+    // orphans: sidecars for sets no longer in the index, and stale temp files
     let mut orphans = 0u64;
     for e in walkdir::WalkDir::new(&parity_dir).into_iter().flatten() {
         if !e.file_type().is_file() {
@@ -144,14 +154,15 @@ pub fn run(ctx: &mut Ctx, args: &FsckArgs) -> Result<()> {
             }
         }
     }
+    let degraded = ctx.db.degraded_sets()?.len();
     println!(
-        "parity store: {} sidecars expected, {missing} missing, {damaged} damaged{}, {orphans} orphan{}",
-        contents.len(),
+        "parity store: {} set(s) expected ({degraded} degraded), {missing} missing, {damaged} damaged{}, {orphans} orphan{}",
+        sets.len(),
         if damaged_kept > 0 { format!(" ({damaged_kept} kept)") } else { String::new() },
         if args.fix && (missing + orphans + damaged - damaged_kept) > 0 { " (fixed)" } else { "" }
     );
     if missing + damaged > 0 && !args.fix {
-        println!("hint: `meticulous fsck --fix` clears missing/damaged parity for intact files, then `meticulous parity sync` regenerates it");
+        println!("hint: `meticulous fsck --fix` clears missing/damaged parity whose members are intact, then `meticulous scan` regenerates it");
     }
     if (missing + damaged + orphans > 0 && !args.fix) || damaged_kept > 0 {
         problems += 1;
@@ -169,7 +180,8 @@ pub fn run(ctx: &mut Ctx, args: &FsckArgs) -> Result<()> {
 }
 
 /// Rebuild index.sqlite from MANIFEST.tsv (preferred: has size/mtime/state) or
-/// MANIFEST.txt, plus PARITY_MARKS.txt and the parity store.
+/// MANIFEST.txt, plus PARITY_MARKS.txt and the parity-set sidecars (whose
+/// member tables reconstruct parity_set/parity_member exactly).
 fn rebuild(ctx: &mut Ctx) -> Result<()> {
     let tsv = ctx.archive.manifest_tsv_path();
     let manifest = ctx.archive.manifest_path();
@@ -212,16 +224,10 @@ fn rebuild(ctx: &mut Ctx) -> Result<()> {
         let rel = path_from_bytes(&pbytes);
         let abs = ctx.archive.abs(&rel);
         let meta = std::fs::metadata(&abs).ok().filter(|m| m.is_file());
-        let sc = mtp::sidecar_path(&parity_dir, &hash);
-        let layout = mtp::Reader::open(&sc).ok().map(|r| *r.layout());
         db.upsert_content(&ContentRow {
             hash: hash.clone(),
             algo,
-            size: rec_size.or(meta.as_ref().map(|m| m.len())).or(layout.map(|l| l.file_size)).unwrap_or(0),
-            block_size: layout.map(|l| l.block_size),
-            blocks_per_stripe: layout.map(|l| l.blocks_per_stripe),
-            parity_ppm: layout.map(|l| l.parity_ppm),
-            has_parity: layout.is_some(),
+            size: rec_size.or(meta.as_ref().map(|m| m.len())).unwrap_or(0),
             created_at: t,
         })?;
         // Without recorded metadata we cannot tell later edits from corruption:
@@ -254,6 +260,51 @@ fn rebuild(ctx: &mut Ctx) -> Result<()> {
         })?;
         n += 1;
     }
+    // Parity sets: every valid sidecar's member table reconstructs the rows.
+    // A member whose content no longer has a file row is dead (erasure).
+    let mut sets_restored = 0u64;
+    for e in walkdir::WalkDir::new(&parity_dir).into_iter().flatten() {
+        if !e.file_type().is_file() || e.path().extension().is_none_or(|x| x != "mts") {
+            continue;
+        }
+        let Ok(r) = mts::Reader::open(e.path()) else {
+            println!("note: unreadable sidecar {} skipped (fsck --fix removes it)", e.path().display());
+            continue;
+        };
+        let layout = r.layout();
+        let set = SetRow {
+            id: r.set_id().to_vec(),
+            algo: r.algo(),
+            block_size: layout.block_size,
+            blocks_per_stripe: layout.blocks_per_stripe,
+            parity_ppm: layout.parity_ppm,
+            min_parity_blocks: layout.min_parity_blocks,
+            n_members: layout.n_members() as u32,
+            n_blocks: layout.n_blocks(),
+            data_bytes: layout.total_data_bytes(),
+            created_at: t,
+        };
+        let mut members = Vec::with_capacity(layout.n_members());
+        for m in 0..layout.n_members() {
+            let hash = r.member_hash(m).to_vec();
+            let referenced: bool = db
+                .conn()
+                .query_row("SELECT EXISTS(SELECT 1 FROM file WHERE content_hash = ?1)", [&hash], |row| {
+                    row.get::<_, i64>(0).map(|v| v != 0)
+                })?;
+            members.push(MemberRow {
+                set_id: set.id.clone(),
+                ord: m as u32,
+                content_hash: hash,
+                size: layout.member_size(m),
+                first_block: layout.member_first_block(m),
+                n_blocks: layout.member_blocks(m),
+                dead: !referenced,
+            });
+        }
+        db.insert_parity_set(&set, &members)?;
+        sets_restored += 1;
+    }
     // marks
     let marks_path = ctx.archive.dir().join(MARKS_FILE);
     if let Ok(s) = std::fs::read_to_string(&marks_path) {
@@ -264,7 +315,7 @@ fn rebuild(ctx: &mut Ctx) -> Result<()> {
                 }
         }
     }
-    db.log_event(Path::new(""), "rebuilt", Some(&format!("database rebuilt from {}: {n} files, {missing} missing", source.display())))?;
+    db.log_event(Path::new(""), "rebuilt", Some(&format!("database rebuilt from {}: {n} files, {missing} missing, {sets_restored} parity sets", source.display())))?;
     db.commit()?;
     db.finish_without_protect()?;
     // swap files
@@ -272,7 +323,7 @@ fn rebuild(ctx: &mut Ctx) -> Result<()> {
         std::fs::rename(&db_path, &broken).context("moving broken database aside")?;
     }
     std::fs::rename(&tmp, &db_path)?;
-    println!("rebuilt: {n} files ({missing} missing on disk). All files are marked unverified; run `meticulous check`.");
+    println!("rebuilt: {n} files ({missing} missing on disk), {sets_restored} parity set(s). All files are marked unverified; run `meticulous check`.");
     if unknown_meta > 0 {
         println!(
             "note: {unknown_meta} files were rebuilt without size/mtime (old MANIFEST.txt); `check` will report them as modified until `scan` re-accepts them"

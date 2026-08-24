@@ -4,7 +4,9 @@ pub mod info;
 pub mod init;
 pub mod manifest;
 pub mod parity;
+pub mod rm;
 pub mod scan;
+pub mod setops;
 
 use crate::cli::{Cli, Command};
 use crate::config::Archive;
@@ -105,6 +107,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         Command::Scan(a) => scan::scan(&mut ctx, &a),
         Command::Accept(a) => scan::accept(&mut ctx, &a),
         Command::Repair(a) => check::repair(&mut ctx, &a),
+        Command::Rm(a) => rm::rm(&mut ctx, &a),
         Command::Parity(a) => parity::run(&mut ctx, &a),
         Command::Status => info::status(&mut ctx),
         Command::Ls(a) => info::ls(&mut ctx, &a),

@@ -1,10 +1,10 @@
 use super::Ctx;
-use super::scan::sidecar_for;
+use super::setops;
 use crate::cli::{ConfigArgs, HistoryArgs, LsArgs};
 use crate::config::ParityMode;
-use crate::mtp;
 use crate::db::State;
 use crate::marks::Resolver;
+use crate::mts;
 use crate::util::{fmt_ago, fmt_bytes, fmt_opt_time, fmt_time, now, parse_duration, parse_parity, parse_size, path_display};
 use anyhow::{Result, bail};
 use std::path::Path;
@@ -22,7 +22,8 @@ pub fn status(ctx: &mut Ctx) -> Result<()> {
                 "algo": cfg.algo.name(),
                 "files": s.files, "bytes": s.bytes, "by_state": s.by_state,
                 "distinct_content": s.distinct_content,
-                "parity_contents": s.parity_contents, "parity_bytes_covered": s.parity_bytes_covered,
+                "parity_sets": s.parity_sets, "parity_sets_degraded": s.parity_sets_degraded,
+                "parity_covered_files": s.parity_covered_files, "parity_bytes_covered": s.parity_bytes_covered,
                 "parity_store_bytes": parity_store,
                 "never_verified": s.never_verified, "oldest_verified": s.oldest_verified,
                 "events": s.events, "db_hash_ok": db_hash_ok,
@@ -43,9 +44,15 @@ pub fn status(ctx: &mut Ctx) -> Result<()> {
     let states: Vec<String> = s.by_state.iter().map(|(k, v)| format!("{v} {k}")).collect();
     println!("states:    {}", if states.is_empty() { "-".into() } else { states.join(", ") });
     println!(
-        "parity:    {} covered ({}), parity store {}",
-        s.parity_contents,
+        "parity:    {} files covered ({}) in {} set(s){}, parity store {}",
+        s.parity_covered_files,
         fmt_bytes(s.parity_bytes_covered),
+        s.parity_sets,
+        if s.parity_sets_degraded > 0 {
+            format!(" — {} DEGRADED (run `meticulous scan` to rebuild)", s.parity_sets_degraded)
+        } else {
+            String::new()
+        },
         fmt_bytes(parity_store)
     );
     println!(
@@ -63,7 +70,7 @@ pub fn status(ctx: &mut Ctx) -> Result<()> {
         }
     );
     let bad: u64 = s.by_state.iter().filter(|(k, _)| k != "ok").map(|(_, v)| v).sum();
-    if bad > 0 || db_hash_ok == Some(false) {
+    if bad > 0 || db_hash_ok == Some(false) || s.parity_sets_degraded > 0 {
         ctx.problems = true;
     }
     Ok(())
@@ -72,13 +79,13 @@ pub fn status(ctx: &mut Ctx) -> Result<()> {
 pub fn ls(ctx: &mut Ctx, args: &LsArgs) -> Result<()> {
     let rels = ctx.rel_paths(&args.paths)?;
     let rows = ctx.db.files_under_any(&rels)?;
-    let pmap = super::scan::parity_map(ctx)?;
+    let live = ctx.db.live_membership_map()?;
     for r in rows {
         if let Some(st) = args.state
             && r.state != st {
                 continue;
             }
-        let has = pmap.get(&r.content_hash).copied().unwrap_or(false);
+        let has = live.contains_key(&r.content_hash);
         if args.parity && !has || args.no_parity && has {
             continue;
         }
@@ -113,8 +120,12 @@ pub fn show(ctx: &mut Ctx, path: &Path) -> Result<()> {
     let content = ctx.db.get_content(&r.content_hash)?;
     let mut resolver = Resolver::new(ctx.db.marks()?, ctx.archive.config.parity_default);
     let (mode, by) = resolver.explain_file(&rel);
-    let sc_path = sidecar_for(ctx, &r.content_hash);
-    let has_sidecar = sc_path.is_file();
+    // Live parity membership (if any) and the geometry needed to judge it.
+    let membership = ctx.db.memberships_of(&r.content_hash)?.into_iter().find(|m| !m.dead);
+    let set_info = match &membership {
+        Some(m) => ctx.db.get_parity_set(&m.set_id)?.map(|s| (m.clone(), s)),
+        None => None,
+    };
     if ctx.json {
         println!(
             "{}",
@@ -123,7 +134,8 @@ pub fn show(ctx: &mut Ctx, path: &Path) -> Result<()> {
                 "hash": format!("{}:{}", content.as_ref().map(|c| c.algo.name()).unwrap_or("?"), hex::encode(&r.content_hash)),
                 "added_at": r.added_at, "updated_at": r.updated_at, "last_verified_at": r.last_verified_at,
                 "parity_mode": mode.name(), "parity_mode_from": path_display(&by),
-                "has_parity": content.as_ref().map(|c| c.has_parity).unwrap_or(false), "sidecar": sc_path.display().to_string(),
+                "has_parity": membership.is_some(),
+                "parity_set": membership.as_ref().map(|m| hex::encode(&m.set_id)),
             })
         );
         return Ok(());
@@ -154,31 +166,52 @@ pub fn show(ctx: &mut Ctx, path: &Path) -> Result<()> {
             format!("mark on {}", path_display(&by))
         }
     );
-    match content {
-        Some(c) if c.has_parity => {
-            println!("parity:        yes ({})", if has_sidecar { sc_path.display().to_string() } else { "SIDECAR MISSING".to_string() });
-            if has_sidecar {
-                match mtp::Reader::open(&sc_path) {
-                    Ok(sc) => {
-                        let l = sc.layout();
-                        println!(
-                            "  layout:      block {} × {} blocks, {} stripes of {} blocks, {} parity blocks ({}), {}% — can repair up to {} bad blocks per stripe",
-                            fmt_bytes(l.block_size as u64),
-                            l.n_blocks(),
-                            l.n_stripes(),
-                            l.blocks_per_stripe,
-                            l.parity_blocks(),
-                            fmt_bytes(l.parity_bytes()),
-                            l.parity_ppm as f64 / 10_000.0,
-                            l.stripe_parity_blocks(0)
-                        );
-                        println!("  block table: {}", if sc.table_ok() { "ok" } else { "DAMAGED" });
-                    }
+    match set_info {
+        Some((m, set)) => {
+            let members = ctx.db.set_members(&set.id)?;
+            let sc_path = mts::sidecar_path(&ctx.archive.parity_dir(), &set.id);
+            println!(
+                "parity:        set {} member {}/{} ({})",
+                hex::encode(&set.id[..8.min(set.id.len())]),
+                m.ord + 1,
+                set.n_members,
+                if sc_path.is_file() { sc_path.display().to_string() } else { "SIDECAR MISSING — run fsck".to_string() }
+            );
+            match setops::layout_from_rows(&set, &members) {
+                Ok(layout) => {
+                    let dead: u64 = members.iter().filter(|x| x.dead).map(|x| x.n_blocks).sum();
+                    println!(
+                        "  set layout:  block {} × {} blocks over {} member(s) ({} data), {} stripe(s), {} parity block(s) ({}), floor {}/stripe{}",
+                        fmt_bytes(layout.block_size as u64),
+                        layout.n_blocks(),
+                        set.n_members,
+                        fmt_bytes(set.data_bytes),
+                        layout.n_stripes(),
+                        layout.parity_blocks(),
+                        fmt_bytes(layout.parity_bytes()),
+                        layout.stripe_parity_blocks(0),
+                        if dead > 0 { format!("; {dead} block(s) DEAD (margin reduced until rebuild)") } else { String::new() }
+                    );
+                    println!(
+                        "  this file:   {} block(s); loss-protected: {}",
+                        m.n_blocks,
+                        if setops::loss_protected(&layout, &members, m.ord as usize) {
+                            "yes (recoverable from the set even if the whole file is lost)"
+                        } else {
+                            "NO (too large for the set's margin; scattered damage is still repairable)"
+                        }
+                    );
+                }
+                Err(e) => println!("  set layout:  INCONSISTENT: {e:#}"),
+            }
+            if sc_path.is_file() {
+                match mts::Reader::open(&sc_path) {
+                    Ok(sc) => println!("  block table: {}", if sc.table_ok() { "ok" } else { "DAMAGED" }),
                     Err(e) => println!("  sidecar:     UNREADABLE: {e:#}"),
                 }
             }
         }
-        _ => println!("parity:        no"),
+        None => println!("parity:        no"),
     }
     let ev = ctx.db.events(Some(&rel), None, 20)?;
     if !ev.is_empty() {
@@ -215,13 +248,14 @@ pub fn config(ctx: &mut Ctx, args: &ConfigArgs) -> Result<()> {
             "block_size" => cfg.block_size.to_string(),
             "stripe_size" => cfg.stripe_size.to_string(),
             "parity" | "parity_ppm" => format!("{}%", cfg.parity_percent()),
+            "parity_min_bytes" => cfg.parity_min_bytes.to_string(),
             "parity_default" => cfg.parity_default.name().to_string(),
             "exclude" => cfg.exclude.join(","),
             "jobs" => cfg.jobs.to_string(),
             _ => return None,
         })
     };
-    let keys = ["algo", "block_size", "stripe_size", "parity", "parity_default", "exclude", "jobs"];
+    let keys = ["algo", "block_size", "stripe_size", "parity", "parity_min_bytes", "parity_default", "exclude", "jobs"];
     match (&args.key, &args.value) {
         (None, _) => {
             for k in keys {
@@ -244,6 +278,7 @@ pub fn config(ctx: &mut Ctx, args: &ConfigArgs) -> Result<()> {
                 "block_size" => cfg.block_size = parse_size(v)? as u32,
                 "stripe_size" => cfg.stripe_size = parse_size(v)?,
                 "parity" | "parity_ppm" => cfg.parity_ppm = parse_parity(v)?,
+                "parity_min_bytes" => cfg.parity_min_bytes = parse_size(v)?,
                 "parity_default" => cfg.parity_default = ParityMode::parse(v)?,
                 "exclude" => cfg.exclude = v.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect(),
                 "jobs" => cfg.jobs = v.parse()?,
@@ -253,8 +288,8 @@ pub fn config(ctx: &mut Ctx, args: &ConfigArgs) -> Result<()> {
             let p = ctx.archive.config_path();
             ctx.archive.config.save(&p)?;
             println!("{k} = {}", show(k, &ctx.archive.config).unwrap());
-            if matches!(k.as_str(), "block_size" | "stripe_size" | "parity" | "parity_ppm") {
-                println!("note: applies to parity generated from now on; existing parity keeps its layout");
+            if matches!(k.as_str(), "block_size" | "stripe_size" | "parity" | "parity_ppm" | "parity_min_bytes") {
+                println!("note: applies to parity sets generated from now on; existing sets keep their layout");
             }
         }
     }

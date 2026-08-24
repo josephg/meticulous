@@ -63,8 +63,19 @@ fn sidecars(root: &Path) -> usize {
     walkdir::WalkDir::new(root.join("_meticulous/parity"))
         .into_iter()
         .flatten()
-        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "mtp"))
+        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "mts"))
         .count()
+}
+
+/// The largest set sidecar (the one holding the big test file).
+fn sidecar_path(root: &Path) -> PathBuf {
+    walkdir::WalkDir::new(root.join("_meticulous/parity"))
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "mts"))
+        .max_by_key(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+        .expect("no set sidecar found")
+        .into_path()
 }
 
 struct Arch {
@@ -73,7 +84,9 @@ struct Arch {
 }
 
 /// Small-block archive so stripes/blocks are easy to reason about:
-/// block 64, stripe 4096 (64 blocks), 5% -> 4 parity blocks per full stripe.
+/// block 64, stripe 4096 (64 blocks); with these sizes every covered file
+/// lands in its own parity set (f and g are >= the packing target, plain
+/// closes a tail set alone).
 fn setup(parity_default: &str) -> Arch {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("archive");
@@ -100,11 +113,15 @@ fn repair_refuses_edited_files_and_keeps_healthy_state() {
     bin(root).args(["check", "d/f"]).assert().code(2).stdout(predicates::str::contains("modified"));
     bin(root).args(["repair", "d/f"]).assert().code(2).stderr(predicates::str::contains("refusing to repair"));
     assert_eq!(fs::read(root.join("d/f")).unwrap(), edited);
-    // H1: repair on a healthy parity-less file leaves it ok
+    // H1: repair on a healthy parity-less file leaves it ok (and untouched)
     let a2 = setup("exclude");
     let root2 = &a2.root;
     bin(root2).args(["scan", "-y"]).assert().success();
-    bin(root2).args(["repair", "d/plain"]).assert().code(2);
+    bin(root2)
+        .args(["repair", "d/plain"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("nothing recorded against it"));
     assert_eq!(state_of(root2, "d/plain"), "ok");
 }
 
@@ -154,13 +171,14 @@ fn unreadable_dir_is_not_a_removal() {
     assert_eq!(sidecars(root), n);
     // nonexistent PATH is an error, not an empty scan
     bin(root).args(["scan", "-y", "nope"]).assert().code(1).stderr(predicates::str::contains("does not exist"));
-    // removing a file keeps its sidecar on disk (orphan) until fsck --fix
+    // removing a file: the same scan drops/rebuilds the affected set and
+    // sweeps the superseded sidecar — fsck finds nothing to complain about.
+    // (With this archive's tiny stripe size each file is its own set, so g's
+    // set simply disappears.)
     fs::remove_file(root.join("d/sub/g")).unwrap();
     bin(root).args(["scan", "-y"]).assert().success().stdout(predicates::str::contains("1 removed"));
-    assert_eq!(sidecars(root), n);
-    bin(root).args(["fsck"]).assert().code(2).stdout(predicates::str::contains("orphan sidecar"));
-    bin(root).args(["fsck", "--fix"]).assert().success();
     assert_eq!(sidecars(root), n - 1);
+    bin(root).args(["fsck", "--deep"]).assert().success().stdout(predicates::str::contains("fsck: ok"));
 }
 
 // C5: fsck --fix must keep partially damaged parity when the file itself is damaged
@@ -170,21 +188,20 @@ fn fsck_fix_keeps_parity_needed_for_repair() {
     let root = &a.root;
     bin(root).args(["scan", "-y"]).assert().success();
     let original = fs::read(root.join("d/f")).unwrap();
-    // damage the file in stripe 0 (block 3) and the sidecar in stripe 10
+    // damage the file in the set's first stripe (block 3 of d/f, the first
+    // member) and the sidecar's LAST stripe (parity bytes near the end).
     flip(&root.join("d/f"), &[3 * 64 + 1], true);
-    let h = hex::encode(blake3::hash(&original).as_bytes());
-    let sc = root.join(format!("_meticulous/parity/{}/{}/{h}.mtp", &h[0..2], &h[2..4]));
-    assert!(sc.is_file());
-    // stripe area begins after header (40+2*32) + table (1563*32+32); stripe = 4*64 parity + 32 hash.
-    let stripe10 = 104 + 1563 * 32 + 32 + 10 * (4 * 64 + 32) + 5;
-    flip(&sc, &[stripe10], true);
+    let sc = sidecar_path(root);
+    let len = fs::metadata(&sc).unwrap().len();
+    flip(&sc, &[len - 3], true);
     bin(root).args(["fsck", "--deep", "--fix"]).assert().code(2).stdout(predicates::str::contains("KEPT"));
     assert!(sc.exists());
     bin(root).args(["repair", "d/f"]).assert().success().stdout(predicates::str::contains("repaired: d/f"));
     assert_eq!(fs::read(root.join("d/f")).unwrap(), original);
-    // now the file is intact: --fix may drop the damaged sidecar and sync regenerates it
-    bin(root).args(["fsck", "--deep", "--fix"]).assert().success().stdout(predicates::str::contains("removed (file(s) intact)"));
-    bin(root).args(["parity", "sync"]).assert().success().stdout(predicates::str::contains("1 generated"));
+    // now every member is intact: --fix may drop the damaged sidecar and the
+    // next sync re-encodes the set
+    bin(root).args(["fsck", "--deep", "--fix"]).assert().success().stdout(predicates::str::contains("removed (every member intact)"));
+    bin(root).args(["parity", "sync"]).assert().success().stdout(predicates::str::contains("1 built"));
     bin(root).args(["fsck", "--deep"]).assert().success();
 }
 

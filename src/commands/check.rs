@@ -1,11 +1,14 @@
 use super::Ctx;
-use super::scan::{mtime_ns, parity_map, sidecar_for};
+use super::scan::mtime_ns;
+use super::setops;
 use crate::cli::{CheckArgs, RepairArgs};
 use crate::db::{FileRow, State};
-use crate::parity;
+use crate::mts;
+use crate::parity::{self, MemberCtx, MemberOutcome};
 use crate::util::{fmt_bytes, now, parse_duration, parse_size, path_display};
 use crate::worker::{self, Done, Job, Settings, Work};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Default)]
@@ -16,12 +19,14 @@ struct Summary {
     unrecoverable: u64,
     modified: u64,
     missing: u64,
+    restorable: u64,
     errors: u64,
     bytes: u64,
 }
 
 struct Tag {
     row: FileRow,
+    set_id: Option<Vec<u8>>,
 }
 
 pub fn check(ctx: &mut Ctx, args: &CheckArgs) -> Result<()> {
@@ -50,7 +55,8 @@ pub fn check(ctx: &mut Ctx, args: &CheckArgs) -> Result<()> {
         }
         rows = keep;
     }
-    let pmap = parity_map(ctx)?;
+    let live = ctx.db.live_membership_map()?;
+    let parity_dir = ctx.archive.parity_dir();
     let mut jobs: Vec<Job<Tag>> = Vec::new();
     let mut sum = Summary::default();
     ctx.db.begin()?;
@@ -68,7 +74,16 @@ pub fn check(ctx: &mut Ctx, args: &CheckArgs) -> Result<()> {
                     ctx.db.set_state(&row.path, State::Missing)?;
                     ctx.db.log_event(&row.path, "missing", None)?;
                 }
-                println!("MISSING: {}", path_display(&row.path));
+                if live.contains_key(&row.content_hash) {
+                    println!(
+                        "MISSING: {} — restorable from its parity set: run `meticulous repair {}`",
+                        path_display(&row.path),
+                        path_display(&row.path)
+                    );
+                    sum.restorable += 1;
+                } else {
+                    println!("MISSING: {}", path_display(&row.path));
+                }
                 sum.missing += 1;
                 continue;
             }
@@ -91,10 +106,18 @@ pub fn check(ctx: &mut Ctx, args: &CheckArgs) -> Result<()> {
             sum.modified += 1;
             continue;
         }
-        let has_parity = pmap.get(&row.content_hash).copied().unwrap_or(false);
-        let sc = sidecar_for(ctx, &row.content_hash);
-        let work = if has_parity && sc.is_file() { Work::CheckBlocks { sidecar: sc } } else { Work::Hash { parity: false } };
-        jobs.push(Job { rel: row.path.clone(), abs, size: row.size, work, tag: Tag { row } });
+        let (work, set_id) = match live.get(&row.content_hash) {
+            Some((sid, ord)) => {
+                let sc = mts::sidecar_path(&parity_dir, sid);
+                if sc.is_file() {
+                    (Work::CheckBlocks { sidecar: sc, ord: *ord as usize }, Some(sid.clone()))
+                } else {
+                    (Work::Hash, None)
+                }
+            }
+            None => (Work::Hash, None),
+        };
+        jobs.push(Job { rel: row.path.clone(), abs, size: row.size, work, tag: Tag { row, set_id } });
     }
     ctx.db.commit()?;
 
@@ -103,7 +126,8 @@ pub fn check(ctx: &mut Ctx, args: &CheckArgs) -> Result<()> {
     } else {
         ctx.say(format!("checking {} files ({})", jobs.len(), fmt_bytes(jobs.iter().map(|j| j.size).sum())));
     }
-    let mut to_repair: Vec<(FileRow, parity::BlockCheck)> = Vec::new();
+    // (set id -> file rows to repair) — grouped so one decode heals them all.
+    let mut to_repair: HashMap<Vec<u8>, Vec<FileRow>> = HashMap::new();
     ctx.db.begin()?;
     let mut n = 0usize;
     worker::run(jobs, &settings, |job, done| {
@@ -112,7 +136,7 @@ pub fn check(ctx: &mut Ctx, args: &CheckArgs) -> Result<()> {
             ctx.db.commit()?;
             ctx.db.begin()?;
         }
-        let row = job.tag.row;
+        let Tag { row, set_id } = job.tag;
         sum.bytes += job.size;
         // If the file changed while we were reading it, say so instead of judging stale bytes.
         if let Ok(m) = std::fs::metadata(&job.abs)
@@ -168,8 +192,17 @@ pub fn check(ctx: &mut Ctx, args: &CheckArgs) -> Result<()> {
                     }
                     sum.ok += 1;
                 } else {
-                    let repairable = bc.repairable();
-                    let st = if repairable { State::Corrupt } else { State::Unrecoverable };
+                    // Estimated repairability: bad blocks vs. the set's live
+                    // margin (dead members counted). `repair` decides for real.
+                    let sid = set_id.clone().unwrap_or_default();
+                    let margin_ok = match (ctx.db.get_parity_set(&sid)?, ctx.db.set_members(&sid)?) {
+                        (Some(set), members) if !members.is_empty() => {
+                            let ord = members.iter().position(|m| m.content_hash == row.content_hash).unwrap_or(0) as u32;
+                            setops::estimated_margin_ok(&set, &members, ord, &bc.bad_blocks).unwrap_or(false)
+                        }
+                        _ => false,
+                    };
+                    let st = if margin_ok { State::Corrupt } else { State::Unrecoverable };
                     let what = if bc.extra_bytes > 0 && bc.bad_blocks.len() <= 1 {
                         format!("{} extra bytes appended", bc.extra_bytes)
                     } else if !bc.unreadable_blocks.is_empty() {
@@ -182,7 +215,7 @@ pub fn check(ctx: &mut Ctx, args: &CheckArgs) -> Result<()> {
                     } else {
                         format!("{} bad block(s) of {}", bc.bad_blocks.len(), bc.n_blocks)
                     };
-                    let detail = format!("{what}{}", if repairable { ", repairable" } else { ", exceeds parity" });
+                    let detail = format!("{what}{}", if margin_ok { ", likely repairable" } else { ", likely exceeds the set's margin" });
                     if row.state != st {
                         ctx.db.set_state(&row.path, st)?;
                     }
@@ -190,32 +223,33 @@ pub fn check(ctx: &mut Ctx, args: &CheckArgs) -> Result<()> {
                     println!(
                         "CORRUPT: {} — {what}{}",
                         path_display(&row.path),
-                        if repairable { " (repairable)" } else { " (NOT repairable: too much damage in a stripe)" }
+                        if margin_ok { " (likely repairable)" } else { " (likely NOT repairable: too much damage in its stripe)" }
                     );
                     sum.corrupt += 1;
-                    if repairable {
-                        to_repair.push((row, bc));
+                    if margin_ok {
+                        to_repair.entry(sid).or_default().push(row);
                     } else {
                         sum.unrecoverable += 1;
                     }
                 }
             }
+            Done::SetEncoded(_) => unreachable!(),
         }
         Ok(())
     })?;
     ctx.db.commit()?;
 
     if args.repair && !to_repair.is_empty() {
-        println!("repairing {} file(s)...", to_repair.len());
-        for (row, bc) in to_repair {
-            match do_repair(ctx, &row, Some(bc), false, false) {
-                Ok(n) => {
-                    println!("repaired: {} ({n} block(s) rebuilt)", path_display(&row.path));
-                    sum.repaired += 1;
-                    sum.corrupt -= 1;
+        println!("repairing {} file(s)...", to_repair.values().map(|v| v.len()).sum::<usize>());
+        for (sid, rows) in to_repair {
+            match repair_via_set(ctx, &sid, rows, false, false) {
+                Ok((r, f)) => {
+                    sum.repaired += r;
+                    sum.corrupt = sum.corrupt.saturating_sub(r);
+                    sum.errors += f;
                 }
                 Err(e) => {
-                    eprintln!("repair failed: {}: {e:#}", path_display(&row.path));
+                    eprintln!("repair failed: {e:#}");
                     sum.errors += 1;
                 }
             }
@@ -223,12 +257,13 @@ pub fn check(ctx: &mut Ctx, args: &CheckArgs) -> Result<()> {
     }
 
     println!(
-        "check complete: {} ok, {} corrupt{}, {} modified, {} missing, {} errors ({} read)",
+        "check complete: {} ok, {} corrupt{}, {} modified, {} missing{}, {} errors ({} read)",
         sum.ok,
         sum.corrupt,
         if sum.repaired > 0 { format!(" ({} repaired)", sum.repaired) } else { String::new() },
         sum.modified,
         sum.missing,
+        if sum.restorable > 0 { format!(" ({} restorable)", sum.restorable) } else { String::new() },
         sum.errors,
         fmt_bytes(sum.bytes)
     );
@@ -238,99 +273,227 @@ pub fn check(ctx: &mut Ctx, args: &CheckArgs) -> Result<()> {
     Ok(())
 }
 
-/// Repair one file. Returns blocks rebuilt (0 = already intact).
+/// Repair (or restore) the given file rows, all members of the set `set_id`.
+/// Reads the whole set once: sibling blocks are hash-verified sources, and any
+/// sibling damage found along the way is repaired too (same safety rules).
+/// Returns (files repaired/restored, files failed).
 ///
-/// Safety: a repair rewrites the file to the content recorded in the index.
-/// It is refused when the file's size or mtime no longer match the index
-/// (i.e. it was edited since the last scan), because then "the recorded
-/// content" may simply be an older version the user replaced on purpose.
-pub fn do_repair(ctx: &mut Ctx, row: &FileRow, precomputed: Option<parity::BlockCheck>, keep_corrupt: bool, dry_run: bool) -> Result<usize> {
-    let abs = ctx.archive.abs(&row.path);
-    let meta = std::fs::metadata(&abs).with_context(|| format!("{} is missing", path_display(&row.path)))?;
-    if mtime_ns(&meta) != row.mtime_ns {
-        bail!(
-            "refusing to repair {}: its mtime changed since the last scan ({} on disk vs {} recorded), so it may have been edited on purpose. \
-             If it is really damaged, `meticulous scan` will tell edits from corruption (it keeps the recorded content for suspected bit rot); otherwise run `scan` to accept the new content.",
-            path_display(&row.path),
-            crate::util::fmt_time(mtime_ns(&meta) / 1_000_000_000),
-            crate::util::fmt_time(row.mtime_ns / 1_000_000_000)
+/// Safety: a repair rewrites a file to the content recorded in the index. A
+/// target whose size/mtime no longer match the index is refused (it may have
+/// been edited on purpose — `meticulous scan` classifies that, `accept`
+/// overrides). Missing files are restored to their recorded path.
+pub fn repair_via_set(ctx: &mut Ctx, set_id: &[u8], targets: Vec<FileRow>, keep_corrupt: bool, dry_run: bool) -> Result<(u64, u64)> {
+    let set = ctx.db.get_parity_set(set_id)?.with_context(|| format!("parity set {} is not in the index", hex::encode(set_id)))?;
+    let members = ctx.db.set_members(set_id)?;
+    setops::layout_from_rows(&set, &members)?; // consistency check
+    let sc_path = mts::sidecar_path(&ctx.archive.parity_dir(), set_id);
+    let mut sc = mts::Reader::open(&sc_path).with_context(|| format!("no usable parity sidecar for set {}", hex::encode(set_id)))?;
+    setops::verify_sidecar_matches(&set, &members, &sc)?;
+
+    // Refuse targets that were edited since the last scan.
+    let mut failed = 0u64;
+    let mut accepted_targets: Vec<FileRow> = Vec::new();
+    for t in targets {
+        let abs = ctx.archive.abs(&t.path);
+        match std::fs::metadata(&abs) {
+            Ok(m) if mtime_ns(&m) != t.mtime_ns => {
+                eprintln!(
+                    "refusing to repair {}: its mtime changed since the last scan ({} on disk vs {} recorded), so it may have been edited on purpose. \
+                     `meticulous scan` tells edits from corruption; `meticulous accept` records the new content.",
+                    path_display(&t.path),
+                    crate::util::fmt_time(mtime_ns(&m) / 1_000_000_000),
+                    crate::util::fmt_time(t.mtime_ns / 1_000_000_000)
+                );
+                failed += 1;
+            }
+            _ => accepted_targets.push(t),
+        }
+    }
+
+    // Build the per-member context.
+    let mut ctxs: Vec<MemberCtx> = Vec::with_capacity(members.len());
+    let mut written_paths: Vec<Option<FileRow>> = vec![None; members.len()];
+    for m in &members {
+        if m.dead {
+            ctxs.push(MemberCtx::default());
+            continue;
+        }
+        let target = accepted_targets.iter().find(|t| t.content_hash == m.content_hash);
+        // A trustworthy source: any file row whose on-disk mtime matches the
+        // index (state may be Corrupt, or the size may differ — truncation is
+        // damage, and every block is hash-verified during the read anyway).
+        // Only an mtime change means "edited on purpose" = pure erasure.
+        let mut source: Option<(FileRow, PathBuf)> = None;
+        for f in ctx.db.files_by_content(&m.content_hash)? {
+            if f.state == State::Missing {
+                continue;
+            }
+            let abs = ctx.archive.abs(&f.path);
+            if let Ok(meta) = std::fs::metadata(&abs)
+                && meta.is_file()
+                && mtime_ns(&meta) == f.mtime_ns
+            {
+                // Prefer the target row itself as the source when it qualifies.
+                let is_target = target.is_some_and(|t| t.path == f.path);
+                if source.is_none() || is_target {
+                    source = Some((f.clone(), abs.clone()));
+                    if is_target {
+                        break;
+                    }
+                }
+            }
+        }
+        let mc = match (&source, target) {
+            (Some((srow, sabs)), _) => {
+                // Damaged members with a matching source are always writable
+                // (sibling auto-repair); quarantine when asked.
+                written_paths[m.ord as usize] = Some(srow.clone());
+                MemberCtx {
+                    source: Some(sabs.clone()),
+                    write_to: Some(sabs.clone()),
+                    keep_corrupt: if keep_corrupt { Some(ctx.archive.quarantine_dir().join(&srow.path)) } else { None },
+                    restore_mtime_ns: None,
+                }
+            }
+            (None, Some(t)) => {
+                // Restore a missing/unreadable file to its recorded path.
+                written_paths[m.ord as usize] = Some(t.clone());
+                MemberCtx {
+                    source: None,
+                    write_to: Some(ctx.archive.abs(&t.path)),
+                    keep_corrupt: None,
+                    restore_mtime_ns: Some(t.mtime_ns),
+                }
+            }
+            (None, None) => MemberCtx::default(),
+        };
+        ctxs.push(mc);
+    }
+
+    let out = parity::repair_set(&mut sc, &ctxs, dry_run)?;
+    let mut repaired = 0u64;
+    for (stripe, erased, par) in &out.unrecoverable_stripes {
+        eprintln!(
+            "set {}: stripe {stripe} has {erased} damaged/missing blocks but only {par} parity blocks — dead members and modified siblings count against the margin",
+            hex::encode(&set_id[..8.min(set_id.len())])
         );
     }
-    let sc_path = sidecar_for(ctx, &row.content_hash);
-    let mut sc = parity::open_sidecar(&sc_path, &row.content_hash)
-        .with_context(|| format!("no usable parity for {}", path_display(&row.path)))?;
-    let bc = match precomputed {
-        Some(b) => b,
-        None => parity::check_blocks(&abs, &sc)?,
-    };
-    if bc.ok(&row.content_hash) {
-        ctx.db.set_verified(&row.path, now(), State::Ok)?;
-        return Ok(0);
-    }
-    let quarantine = if keep_corrupt { Some(ctx.archive.quarantine_dir().join(&row.path)) } else { None };
-    let out = match parity::repair_file(&abs, &mut sc, &bc, quarantine.as_deref(), dry_run) {
-        Ok(o) => o,
-        Err(e) => {
-            // The pre-check showed real damage that parity cannot fix.
-            if !dry_run && row.state != State::Unrecoverable {
-                ctx.db.set_state(&row.path, State::Unrecoverable)?;
+    for (ord, outcome) in out.members.iter().enumerate() {
+        let row = written_paths[ord].as_ref();
+        match (outcome, row) {
+            (MemberOutcome::Repaired { blocks }, Some(row)) => {
+                let abs = ctx.archive.abs(&row.path);
+                let meta = std::fs::metadata(&abs)?;
+                let t = now();
+                ctx.db.upsert_file(&FileRow {
+                    size: meta.len(),
+                    mtime_ns: mtime_ns(&meta),
+                    inode: Some(std::os::unix::fs::MetadataExt::ino(&meta)),
+                    state: State::Ok,
+                    updated_at: t,
+                    last_verified_at: Some(t),
+                    ..row.clone()
+                })?;
+                ctx.db.log_event(&row.path, "repaired", Some(&format!("{blocks} block(s) rebuilt from the parity set")))?;
+                println!("repaired: {} ({blocks} block(s) rebuilt)", path_display(&row.path));
+                repaired += 1;
             }
-            return Err(e);
+            (MemberOutcome::Restored { bytes }, Some(row)) => {
+                let abs = ctx.archive.abs(&row.path);
+                let meta = std::fs::metadata(&abs)?;
+                let t = now();
+                ctx.db.upsert_file(&FileRow {
+                    size: meta.len(),
+                    mtime_ns: mtime_ns(&meta),
+                    inode: Some(std::os::unix::fs::MetadataExt::ino(&meta)),
+                    state: State::Ok,
+                    updated_at: t,
+                    last_verified_at: Some(t),
+                    ..row.clone()
+                })?;
+                ctx.db.log_event(&row.path, "restored", Some(&format!("{bytes} bytes rebuilt entirely from the parity set")))?;
+                println!("restored: {} ({} rebuilt from siblings + parity)", path_display(&row.path), fmt_bytes(*bytes));
+                repaired += 1;
+            }
+            (MemberOutcome::WouldRepair { blocks }, Some(row)) => {
+                println!("would repair: {} ({blocks} block(s))", path_display(&row.path));
+                repaired += 1;
+            }
+            (MemberOutcome::WouldRestore { bytes }, Some(row)) => {
+                println!("would restore: {} ({})", path_display(&row.path), fmt_bytes(*bytes));
+                repaired += 1;
+            }
+            (MemberOutcome::Failed { msg }, Some(row)) => {
+                eprintln!("cannot repair {}: {msg}", path_display(&row.path));
+                if !dry_run && row.state != State::Unrecoverable {
+                    ctx.db.set_state(&row.path, State::Unrecoverable)?;
+                }
+                failed += 1;
+            }
+            (MemberOutcome::Failed { msg }, None) => {
+                eprintln!("set {}: member {ord}: {msg}", hex::encode(&set_id[..8.min(set_id.len())]));
+                failed += 1;
+            }
+            (MemberOutcome::DamagedNotWritable { bad_blocks }, _) => {
+                eprintln!(
+                    "note: set {}: member {ord} has {bad_blocks} damaged block(s) but no writable file",
+                    hex::encode(&set_id[..8.min(set_id.len())])
+                );
+            }
+            _ => {}
         }
-    };
-    if !dry_run {
-        let meta = std::fs::metadata(&abs)?;
-        let t = now();
-        ctx.db.upsert_file(&FileRow {
-            size: meta.len(),
-            mtime_ns: mtime_ns(&meta),
-            inode: Some(std::os::unix::fs::MetadataExt::ino(&meta)),
-            state: State::Ok,
-            updated_at: t,
-            last_verified_at: Some(t),
-            ..row.clone()
-        })?;
-        ctx.db.log_event(
-            &row.path,
-            "repaired",
-            Some(&format!(
-                "{} block(s) rebuilt from parity{}",
-                out.blocks_repaired,
-                quarantine.as_ref().map(|q| format!("; damaged copy kept at {}", q.display())).unwrap_or_default()
-            )),
-        )?;
     }
-    Ok(out.blocks_repaired)
+    Ok((repaired, failed))
 }
 
 pub fn repair(ctx: &mut Ctx, args: &RepairArgs) -> Result<()> {
     let rels = ctx.rel_paths(&args.paths)?;
     let rows = ctx.db.files_under_any(&rels)?;
-    let explicit: Vec<PathBuf> = rels.iter().filter(|r| ctx.archive.abs(r).is_file()).cloned().collect();
+    let explicit: Vec<PathBuf> = rels.iter().filter(|r| ctx.db.get_file(r).ok().flatten().is_some()).cloned().collect();
+    let live = ctx.db.live_membership_map()?;
     let candidates: Vec<FileRow> = rows
         .into_iter()
-        .filter(|r| matches!(r.state, State::Corrupt | State::Unrecoverable) || explicit.contains(&r.path))
+        .filter(|r| matches!(r.state, State::Corrupt | State::Unrecoverable | State::Missing) || explicit.contains(&r.path))
         .collect();
     if candidates.is_empty() {
-        println!("nothing to repair (no files in state corrupt/unrecoverable under the given paths)");
+        println!("nothing to repair (no files in state corrupt/unrecoverable/missing under the given paths)");
         return Ok(());
     }
-    let mut repaired = 0;
-    let mut failed = 0;
+    // Group by parity set; files without a live membership cannot be repaired.
+    let mut by_set: HashMap<Vec<u8>, Vec<FileRow>> = HashMap::new();
+    let mut repaired = 0u64;
+    let mut failed = 0u64;
     for row in candidates {
-        match do_repair(ctx, &row, None, args.keep_corrupt, args.dry_run) {
-            Ok(0) => println!("ok: {} (already intact)", path_display(&row.path)),
-            Ok(n) => {
-                println!("{}: {} ({n} block(s) rebuilt)", if args.dry_run { "would repair" } else { "repaired" }, path_display(&row.path));
-                repaired += 1;
+        match live.get(&row.content_hash) {
+            Some((sid, _)) => by_set.entry(sid.clone()).or_default().push(row),
+            None => {
+                if row.state == State::Ok {
+                    println!("ok: {} (nothing recorded against it)", path_display(&row.path));
+                } else {
+                    eprintln!("cannot repair {}: no parity covers its recorded content", path_display(&row.path));
+                    failed += 1;
+                }
+            }
+        }
+    }
+    ctx.db.begin()?;
+    for (sid, targets) in by_set {
+        match repair_via_set(ctx, &sid, targets, args.keep_corrupt, args.dry_run) {
+            Ok((r, f)) => {
+                repaired += r;
+                failed += f;
             }
             Err(e) => {
-                eprintln!("cannot repair {}: {e:#}", path_display(&row.path));
+                eprintln!("repair failed for set {}: {e:#}", hex::encode(&sid[..8.min(sid.len())]));
                 failed += 1;
             }
         }
     }
-    println!("repair complete: {repaired} repaired, {failed} failed");
+    ctx.db.commit()?;
+    println!(
+        "repair complete: {repaired} {}, {failed} failed",
+        if args.dry_run { "would be repaired" } else { "repaired" }
+    );
     if failed > 0 {
         ctx.problems = true;
     }

@@ -63,7 +63,9 @@ fn setup() -> Arch {
     fs::write(root.join("foo/a/b/c.bin"), pseudo(150_000, 3)).unwrap();
     fs::write(root.join("other/small.txt"), b"hello world\n").unwrap();
     fs::write(root.join("other/empty"), b"").unwrap();
-    bin(&root).args(["init", "."]).assert().success();
+    // 0.2% parity so damage can actually exceed the margin in tests (at the
+    // default 5%, the underfull boost fully duplicates archives this small).
+    bin(&root).args(["init", ".", "--parity", "0.2%"]).assert().success();
     bin(&root).args(["parity", "include", "foo"]).assert().success();
     bin(&root).args(["parity", "exclude", "foo/bar"]).assert().success();
     Arch { _tmp: tmp, root }
@@ -92,7 +94,7 @@ fn scan_check_repair_cycle() {
     // clean check passes
     bin(root).arg("check").assert().success().stdout(predicates::str::contains("5 ok"));
 
-    // damage 3 blocks of big.bin (64 KiB blocks) and 1 of zot (no parity)
+    // damage 3 distinct blocks of big.bin (~1600-byte set blocks) and 1 of zot (no parity)
     damage(&root.join("foo/big.bin"), &[10, 65536 * 5 + 3, 65536 * 40]);
     damage(&root.join("foo/bar/zot.bin"), &[999]);
     bin(root)
@@ -110,8 +112,10 @@ fn scan_check_repair_cycle() {
     bin(root).args(["check", "foo/big.bin", "--repair"]).assert().success().stdout(predicates::str::contains("1 repaired"));
     assert_eq!(fs::read(root.join("foo/big.bin")).unwrap(), pseudo(3_000_000, 1));
 
-    // too much damage -> unrecoverable
-    let offs: Vec<u64> = (0..8).map(|i| i * 65536 + 100).collect();
+    // too much damage -> unrecoverable. The set holds c.bin + big.bin at a
+    // ~1600-byte block size; 0.2% of the 128 MiB packing target is ~168
+    // parity blocks, so 200 damaged blocks exceed the margin.
+    let offs: Vec<u64> = (0..200).map(|i| i * 1600 + 100).collect();
     damage(&root.join("foo/big.bin"), &offs);
     bin(root).args(["check", "foo"]).assert().code(2).stdout(predicates::str::contains("NOT repairable"));
     bin(root).args(["repair", "foo/big.bin"]).assert().code(2);
@@ -164,11 +168,11 @@ fn parity_sync_and_prune_and_fsck() {
     let root = &a.root;
     bin(root).args(["scan", "-y", "--no-parity"]).assert().success();
     bin(root).args(["parity", "list"]).assert().success().stdout(predicates::str::contains("2 files"));
-    bin(root).args(["parity", "sync"]).assert().success().stdout(predicates::str::contains("2 generated"));
+    bin(root).args(["parity", "sync"]).assert().success().stdout(predicates::str::contains("1 built"));
     bin(root).args(["parity", "exclude", "foo"]).assert().success();
     bin(root).args(["parity", "sync", "--prune"]).assert().success().stdout(predicates::str::contains("2 pruned"));
     bin(root).args(["parity", "unmark", "foo"]).assert().success();
-    bin(root).args(["parity", "sync"]).assert().success().stdout(predicates::str::contains("0 generated"));
+    bin(root).args(["parity", "sync"]).assert().success().stdout(predicates::str::contains("0 built"));
     bin(root).args(["fsck", "--deep"]).assert().success().stdout(predicates::str::contains("fsck: ok"));
 
     // damage a sidecar -> fsck --deep notices; --fix removes it; sync regenerates
@@ -184,7 +188,7 @@ fn parity_sync_and_prune_and_fsck() {
     damage(&sc, &[len - 3]);
     bin(root).args(["fsck", "--deep"]).assert().code(2).stdout(predicates::str::contains("damaged sidecar"));
     bin(root).args(["fsck", "--deep", "--fix"]).assert().success();
-    bin(root).args(["parity", "sync"]).assert().success().stdout(predicates::str::contains("1 generated"));
+    bin(root).args(["parity", "sync"]).assert().success().stdout(predicates::str::contains("1 built"));
     bin(root).args(["fsck", "--deep"]).assert().success();
 }
 
