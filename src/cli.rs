@@ -80,8 +80,8 @@ pub enum Command {
     /// Write a plaintext checksum manifest (b3sum/sha256sum compatible).
     Export(ExportArgs),
 
-    /// Verify files against an existing checksum list (md5sum/sha256sum/b3sum
-    /// format) and index any files not yet known.
+    /// Verify files against an existing checksum list (b3sum/sha256sum format)
+    /// and index any files not yet known.
     Import(ImportArgs),
 
     /// Check the index database and parity store for damage.
@@ -244,7 +244,8 @@ pub struct ExportArgs {
 pub struct ImportArgs {
     /// Checksum list file (lines of "<hex>  <path>", coreutils style).
     pub file: PathBuf,
-    /// Algorithm of the listed hashes (inferred from digest length when unambiguous).
+    /// Algorithm of the listed hashes (default: the archive's own algorithm —
+    /// blake3 and sha256 digests are indistinguishable by length).
     #[arg(long, value_enum)]
     pub algo: Option<Algo>,
     /// Paths in the list are relative to this directory (default: the list's own directory).

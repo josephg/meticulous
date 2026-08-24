@@ -146,9 +146,6 @@ pub fn show(ctx: &mut Ctx, path: &Path) -> Result<()> {
     println!("mtime:         {}", fmt_time(r.mtime_ns / 1_000_000_000));
     if let Some(c) = &content {
         println!("hash:          {}:{}", c.algo, hex::encode(&r.content_hash));
-        if c.algo == crate::hash::Algo::Fletcher4 {
-            println!("  (zdb form):  {}", crate::hash::Digest::new(c.algo, r.content_hash.clone()).zfs_format());
-        }
     }
     println!("added:         {}", fmt_time(r.added_at));
     println!("updated:       {}", fmt_time(r.updated_at));

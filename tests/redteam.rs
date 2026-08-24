@@ -290,8 +290,8 @@ fn walk_rules() {
 fn import_mismatch_not_indexed() {
     let a = setup("exclude");
     let root = &a.root;
-    fs::write(root.join("list.md5"), "00000000000000000000000000000000  d/plain\n").unwrap();
-    bin(root).args(["import", "list.md5"]).assert().code(2).stdout(predicates::str::contains("left unindexed"));
+    fs::write(root.join("list.b3"), format!("{}  d/plain\n", "0".repeat(64))).unwrap();
+    bin(root).args(["import", "list.b3"]).assert().code(2).stdout(predicates::str::contains("left unindexed"));
     bin(root).args(["ls"]).assert().success().stdout(predicates::str::contains("d/plain").not());
 }
 

@@ -53,14 +53,15 @@ its id, only unreferenced.
 
 ## `.mts` parity-set sidecar (version 2)
 
-All integers little-endian. `dl` = digest length of the algorithm (32 for
-blake3/sha256/sha512-256/fletcher4).
+All integers little-endian. `dl` = digest length of the algorithm (always 32:
+both supported algorithms are 256-bit).
 
 ```
 off     len   field
 0       8     magic "MTPARSET"
 8       4     version = 2 (u32)
-12      1     algo id: 1=blake3 2=sha256 3=sha512-256 4=fletcher4 5=md5 6=sha1
+12      1     algo id: 1=blake3 2=sha256 (3..6 were sha512-256/fletcher4/md5/sha1,
+              removed; the ids stay retired and are rejected on read)
 13      1     dl
 14      2     reserved (0)
 16      4     block size B (u32, multiple of 64)
@@ -117,11 +118,10 @@ are content-derived so re-runs are idempotent.
 
 ## ZFS notes
 
-ZFS checksums are per record (block pointer), cover the *compressed* on-disk
-bytes, and `checksum=on` means fletcher4. `zdb -ddddd <dataset> <inode>` shows
-them as `cksum=a:b:c:d`. meticulous's `fletcher4` reproduces ZFS's native
-(little-endian word) algorithm. ZFS's blake3/skein/edonr are salted per pool
-and cannot be reproduced outside the pool.
+ZFS checksums are per record (block pointer) and cover the *compressed*
+on-disk bytes, so they are not comparable with meticulous's whole-file
+digests. Reproducing them is not a goal, and the algorithms that existed only
+for it (`fletcher4`, `sha512-256`) have been removed.
 
 When ZFS detects an unhealable checksum error it returns EIO for the whole
 record; meticulous reads around the bad record, treats its blocks as erasures

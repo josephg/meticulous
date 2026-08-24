@@ -99,12 +99,6 @@ impl Config {
         if self.parity_min_bytes > self.stripe_size / 4 {
             bail!("parity_min_bytes must be <= stripe_size / 4 ({} bytes)", self.stripe_size / 4);
         }
-        if !self.algo.strong() {
-            eprintln!(
-                "warning: {} is not a cryptographic hash; it is fine for bit-rot detection but weak for identity/dedup",
-                self.algo
-            );
-        }
         Ok(())
     }
     pub fn parity_percent(&self) -> f64 {

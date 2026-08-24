@@ -210,23 +210,32 @@ fn export_import_and_rebuild() {
         .success()
         .stdout(predicates::str::contains("5 match, 0 MISMATCH"));
 
-    // md5 list with one wrong entry
-    use md5::Digest as _;
-    let md5 = format!(
+    // a foreign-algorithm (sha256) list, in a blake3 archive, with one wrong entry
+    use sha2::Digest as _;
+    let sha = format!(
         "{}  other/small.txt\n{}  foo/big.bin\n",
-        hex::encode(md5::Md5::digest(b"hello world\n")),
-        hex::encode(md5::Md5::digest(b"wrong"))
+        hex::encode(sha2::Sha256::digest(b"hello world\n")),
+        hex::encode(sha2::Sha256::digest(b"wrong"))
     );
-    fs::write(root.join("legacy.md5"), md5).unwrap();
+    fs::write(root.join("legacy.sha256"), sha).unwrap();
     bin(root)
-        .args(["import", "legacy.md5"])
+        .args(["import", "legacy.sha256", "--algo", "sha256"])
         .assert()
         .code(2)
         .stdout(predicates::str::contains("1 match, 1 MISMATCH"));
 
+    // md5/sha1 lists are no longer supported: rejected on digest length, not silently misread
+    fs::write(root.join("legacy.md5"), "5eb63bbbe01eeed093cb22bb8f5acdc3  other/small.txt\n").unwrap();
+    bin(root)
+        .args(["import", "legacy.md5"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("16-byte digests"));
+    fs::remove_file(root.join("legacy.md5")).unwrap();
+
     // rebuild the db from the manifest
     let marks_before = fs::read_to_string(root.join("_meticulous/PARITY_MARKS.txt")).unwrap();
-    fs::remove_file(root.join("legacy.md5")).unwrap();
+    fs::remove_file(root.join("legacy.sha256")).unwrap();
     bin(root).args(["fsck", "--rebuild-db"]).assert().success();
     bin(root).args(["scan", "-y"]).assert().success().stdout(predicates::str::contains("5 unchanged"));
     bin(root).arg("check").assert().success().stdout(predicates::str::contains("5 ok"));

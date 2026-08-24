@@ -18,7 +18,7 @@ pub fn write_sidecar_files(archive: &Archive, db: &Db) -> Result<()> {
     let tmp = archive.manifest_path().with_extension("txt.tmp");
     {
         let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-        write_manifest(db, &mut w, archive.config.algo)?;
+        write_manifest(db, &mut w)?;
         w.flush()?;
     }
     std::fs::rename(&tmp, archive.manifest_path())?;
@@ -42,7 +42,7 @@ pub fn write_sidecar_files(archive: &Archive, db: &Db) -> Result<()> {
 
 /// coreutils-style "<hex>  <path>" for every non-missing file. Paths are
 /// written as raw bytes (what `sha256sum -c` expects), coreutils-escaped.
-pub fn write_manifest(db: &Db, w: &mut dyn Write, _algo: Algo) -> Result<()> {
+pub fn write_manifest(db: &Db, w: &mut dyn Write) -> Result<()> {
     for f in db.files_under(Path::new(""))? {
         if f.state == State::Missing {
             continue;
@@ -104,7 +104,7 @@ pub fn export(ctx: &mut Ctx, args: &ExportArgs) -> Result<()> {
         None => Box::new(std::io::BufWriter::new(std::io::stdout())),
     };
     match args.format.as_str() {
-        "sum" => write_manifest(&ctx.db, &mut out, ctx.archive.config.algo)?,
+        "sum" => write_manifest(&ctx.db, &mut out)?,
         "json" => {
             let live = ctx.db.live_membership_map()?;
             for f in ctx.db.files_under(Path::new(""))? {
@@ -128,7 +128,10 @@ pub fn export(ctx: &mut Ctx, args: &ExportArgs) -> Result<()> {
     }
     out.flush()?;
     if let (Some(p), false) = (&args.output, ctx.quiet) {
-        eprintln!("wrote {}", p.display());
+        match args.format.as_str() {
+            "sum" => eprintln!("wrote {} (verify with `{} -c {}`)", p.display(), ctx.archive.config.algo.manifest_tool(), p.display()),
+            _ => eprintln!("wrote {}", p.display()),
+        }
     }
     Ok(())
 }
@@ -192,19 +195,22 @@ pub fn import(ctx: &mut Ctx, args: &ImportArgs) -> Result<()> {
         bail!("mixed digest lengths in list; split it per algorithm");
     }
     let len = *lens.iter().next().unwrap();
-    let algo = match args.algo {
-        Some(a) => a,
-        None => match len {
-            16 => Algo::Md5,
-            20 => Algo::Sha1,
-            32 if native.digest_len() == 32 => native,
-            _ => bail!("cannot infer the list's hash algorithm from digest length {len}; pass --algo"),
-        },
-    };
-    if algo.digest_len() != len {
-        bail!("--algo {algo} has {}-byte digests but the list has {len}-byte digests", algo.digest_len());
+    if len != Algo::DIGEST_LEN {
+        bail!(
+            "the list has {len}-byte digests; meticulous only supports blake3 and sha256 (32-byte digests). \
+             Check an md5/sha1 list with `md5sum -c` / `sha1sum -c` instead."
+        );
     }
-    ctx.say(format!("importing {} entries ({algo}) from {}{}", listed.len(), args.file.display(), if bad_lines > 0 { format!(", {bad_lines} unparsed lines") } else { String::new() }));
+    // blake3 and sha256 digests are the same length, so the list's algorithm
+    // cannot be inferred: assume the archive's own unless told otherwise.
+    let algo = args.algo.unwrap_or(native);
+    ctx.say(format!(
+        "importing {} entries ({algo}{}) from {}{}",
+        listed.len(),
+        if args.algo.is_none() { ", assumed; pass --algo if the list is not" } else { "" },
+        args.file.display(),
+        if bad_lines > 0 { format!(", {bad_lines} unparsed lines") } else { String::new() }
+    ));
 
     let settings = Settings::from_archive(&ctx.archive, args.jobs, ctx.quiet);
     let (mut ok, mut mismatch, mut missing, mut added, mut trusted, mut errors) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);

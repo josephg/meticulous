@@ -6,9 +6,11 @@ meticulous maintains an index of per-file checksums **inside the archive**
 directories you choose — stores **Reed–Solomon parity** so a bounded amount of
 damage in each file can be *repaired*, not just detected.
 
-* Hashes: `blake3` (default), `sha256`, `sha512-256`, `fletcher4` — the last
-  three are the algorithms ZFS can use, and `fletcher4` reproduces ZFS's native
-  checksum exactly. Every stored digest is tagged with its algorithm.
+* Hashes: `blake3` (default) or `sha256` — both cryptographic, both 256-bit.
+  blake3 is several times faster on any CPU (~6.7 GiB/s per core vs 2.5 GiB/s
+  for sha256 *with* SHA-NI, ~0.4 GiB/s without); choose `sha256` only if you
+  want `sha256sum` to be able to verify the manifest on any machine. Every
+  stored digest is tagged with its algorithm.
 * Parity: **shared across files** (PAR2-style "parity sets", see `FORMAT.md`):
   many files pack into one Reed–Solomon set, a configurable percentage
   (default 5 %) of parity overall. Any `k` bad or missing blocks per stripe
@@ -54,7 +56,7 @@ holding `_meticulous/`); you can run commands from any subdirectory.
 | `parity include\|exclude\|unmark DIRS`, `parity list`, `parity sync [--prune]` | choose which subtrees store parity; run the parity phase by hand / drop parity no longer wanted |
 | `status`, `ls [--state S] [--parity] [-l]`, `show PATH`, `history [PATH] [--since 7d]` | inspect |
 | `export [--format sum\|json] [-o FILE]` | plaintext manifest |
-| `import FILE [--algo md5\|sha1\|…] [--relative-to DIR] [--trust]` | verify files against an old `md5sum`/`sha1sum`/`sha256sum`/`b3sum` list and index any files not yet known |
+| `import FILE [--algo blake3\|sha256] [--relative-to DIR] [--trust]` | verify files against an existing `b3sum`/`sha256sum` list and index any files not yet known. The list's algorithm defaults to the archive's own — blake3 and sha256 digests are the same length, so pass `--algo` when it differs |
 | `fsck [--deep] [--fix] [--rebuild-db]` | check SQLite integrity, the database's own hash, every parity sidecar; rebuild the index from `MANIFEST.txt` |
 | `config [KEY [VALUE]]` | show/change settings |
 
@@ -136,7 +138,8 @@ cannot heal makes the read fail with `EIO`, which meticulous reports as
 `unrecoverable` rather than recording a hash). Before the first scan it is worth
 running `zpool status -v` (and optionally a `zpool scrub`). Note ZFS can only
 vouch for data since it was written to ZFS — damage that happened on older
-disks is invisible to it; use `import` with your old md5/sha1 lists for that.
+disks is invisible to it; `import` an old `b3sum`/`sha256sum` list for that
+(md5/sha1 lists are not supported — check those with `md5sum -c` first).
 
 **When ZFS itself reports a corrupt file** (`EIO` on read, listed in
 `zpool status -v`): ZFS refuses to return the bad record but happily returns
@@ -151,11 +154,10 @@ guarantees at least one record of parity per stripe. Afterwards run
 without parity are `unrecoverable` and must come from a backup/snapshot.
 
 ZFS's own checksums are per record, computed over the *compressed* on-disk
-bytes, `fletcher4` by default, and its blake3/skein/edonr are salted per pool.
-meticulous can hash with `--algo fletcher4|sha256|sha512-256` (ZFS's
-reproducible algorithms; `fletcher4` is not cryptographic) and `init` on a ZFS
-dataset defaults the block size to the recordsize, but record-by-record
-comparison against zdb is deliberately not implemented for now.
+bytes, and are not comparable with meticulous's whole-file hashes; meticulous
+no longer implements ZFS's algorithms (`fletcher4`, `sha512-256`) since
+record-by-record comparison against zdb is not a goal. `init` on a ZFS dataset
+still defaults the block size to the recordsize.
 
 ## Exit codes
 
